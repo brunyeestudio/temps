@@ -1008,7 +1008,6 @@ impl Role {
                 Permission::ApiKeysRead,
                 Permission::ApiKeysWrite,
                 Permission::ApiKeysCreate,
-                Permission::AuditRead,
                 Permission::BackupsRead,
                 Permission::BackupsWrite,
                 Permission::BackupsCreate,
@@ -1101,7 +1100,6 @@ impl Role {
                 Permission::DomainsRead,
                 Permission::EnvironmentsRead,
                 Permission::AnalyticsRead,
-                Permission::AuditRead,
                 Permission::BackupsRead,
                 Permission::CronsRead,
                 Permission::ExternalServicesRead,
@@ -1341,6 +1339,27 @@ mod tests {
             Some(Permission::SecretsRead)
         );
         assert!(Permission::all().contains(&Permission::SecretsRead));
+    }
+
+    #[test]
+    fn test_audit_read_is_restricted_to_administration_roles() {
+        // The audit log is a platform-wide, security-sensitive view (every
+        // user's and admin's actions, IP addresses, emails). Only the
+        // administration roles may read it; lower-privilege roles must not (an
+        // operator can still grant `audit:read` to a specific API key).
+        assert!(Role::Admin.has_permission(&Permission::AuditRead));
+        assert!(Role::PlatformAdmin.has_permission(&Permission::AuditRead));
+        for role in [
+            Role::User,
+            Role::Reader,
+            Role::ApiReader,
+            Role::MetricsIngest,
+        ] {
+            assert!(
+                !role.has_permission(&Permission::AuditRead),
+                "role {role:?} must not hold audit:read"
+            );
+        }
     }
 
     // Deployment token permission tests
