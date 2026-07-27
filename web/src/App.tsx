@@ -45,6 +45,9 @@ import { PluginPage } from './pages/plugins/PluginPage'
 const Account = lazy(() =>
   import('./pages/Account').then((m) => ({ default: m.Account }))
 )
+const Setup = lazy(() =>
+  import('./pages/Setup').then((m) => ({ default: m.Setup }))
+)
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
 )
@@ -300,6 +303,12 @@ const AiGateway = lazy(() =>
     default: m.AiGatewayPage,
   }))
 )
+
+const AiChat = lazy(() =>
+  import('./pages/AiChat').then((m) => ({
+    default: m.AiChat,
+  }))
+)
 const AgentSandboxLayout = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxLayout').then((m) => ({
     default: m.AgentSandboxLayout,
@@ -459,6 +468,7 @@ const FullAppRoutes = () => {
                 <Route path="/" element={<Navigate to="/projects" replace />} />
                 <Route path="/dashboard" element={<Navigate to="/projects" replace />} />
                 <Route path="/account" element={<Account />} />
+                <Route path="/setup" element={<Setup />} />
                 <Route path="/projects" element={<Projects />} />
                 <Route path="/revenue" element={<Revenue />} />
                 <Route path="/sandboxes" element={<Sandboxes />} />
@@ -541,6 +551,7 @@ const FullAppRoutes = () => {
                 <Route path="/email/providers/:id" element={<EmailProviderDetail />} />
                 <Route path="/email/:id" element={<EmailDetail />} />
                 <Route path="/ai-gateway" element={<AiGateway />} />
+                <Route path="/chat" element={<AiChat />} />
                 <Route path="/agent-sandbox" element={<AgentSandboxLayout />}>
                   <Route index element={<AgentSandboxDashboard />} />
                   <Route path="providers" element={<AgentSandboxProvidersList />} />

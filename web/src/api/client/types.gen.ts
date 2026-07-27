@@ -15836,6 +15836,11 @@ export type TemplateResponse = {
      */
     preset: string;
     /**
+     * URL to a wide screenshot/banner preview of the deployed template.
+     * Absent for templates that don't have one captured yet.
+     */
+    screenshot_url?: string | null;
+    /**
      * Required external services
      */
     services: Array<string>;
