@@ -9884,12 +9884,28 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
 
 /**
  * Configuration for Nixpacks preset
- * Nixpacks auto-detects your application and uses nixpacks.toml for configuration
- * No additional parameters needed - configuration is expressed in nixpacks.toml file
+ * Nixpacks provider and inline build-plan configuration.
  */
 export type NixpacksPresetConfig = {
-    [key: string]: unknown;
+    /**
+     * Optional inline nixpacks.toml contents.
+     */
+    nixpacksConfig?: string | null;
+    /**
+     * Ordered Nixpacks providers. Empty means repository config or auto-detect;
+     * include `...` to combine auto-detection with explicit providers.
+     */
+    providers?: Array<NixpacksProvider>;
 };
+
+/**
+ * A Nixpacks build provider.
+ *
+ * `Auto` serializes as the native Nixpacks `...` marker, which includes the
+ * provider detected from the project alongside any explicitly listed
+ * providers.
+ */
+export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
 
 export type NodeContainerListResponse = {
     containers: Array<NodeContainerResponse>;
