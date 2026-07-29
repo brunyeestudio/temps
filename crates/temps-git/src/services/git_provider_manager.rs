@@ -3417,22 +3417,28 @@ impl GitProviderManager {
         detected_presets
             .into_iter()
             .map(|preset| {
-                // Parse preset slug to get metadata from entity enum
-                let preset_enum = preset.slug.parse::<temps_entities::preset::Preset>().ok();
+                let preset_enum =
+                    temps_entities::preset::Preset::resolve_storage_slug(&preset.slug)
+                        .ok()
+                        .map(|(p, _)| p);
 
-                let exposed_port = preset_enum
-                    .as_ref()
-                    .and_then(|p| p.exposed_port())
-                    .or(preset.exposed_port);
+                // Prefer temps-presets metadata (covers nixpacks-* UI slugs); fall back to entity.
+                let exposed_port = preset
+                    .exposed_port
+                    .or_else(|| preset_enum.as_ref().and_then(|p| p.exposed_port()));
 
-                let icon_url = preset_enum
-                    .as_ref()
-                    .and_then(|p| p.icon_url())
-                    .map(|s| s.to_string());
+                let icon_url = temps_presets::get_preset_by_slug(&preset.slug)
+                    .map(|p| p.icon_url())
+                    .or_else(|| {
+                        preset_enum
+                            .as_ref()
+                            .and_then(|p| p.icon_url())
+                            .map(|s| s.to_string())
+                    });
 
-                let project_type = preset_enum
-                    .as_ref()
+                let project_type = temps_presets::get_preset_by_slug(&preset.slug)
                     .map(|p| p.project_type().to_string())
+                    .or_else(|| preset_enum.as_ref().map(|p| p.project_type().to_string()))
                     .unwrap_or_else(|| "unknown".to_string());
 
                 ProjectPresetDomain {

@@ -1138,12 +1138,13 @@ impl WorkflowPlanner {
 
         // Check if this preset supports static deployment using temps-presets
         // Get the preset instance and check if it has a static output directory
-        let preset_instance = temps_presets::get_preset_by_slug(project.preset.as_str());
+        let runtime_slug = project.preset.runtime_slug(project.preset_config.as_ref());
+        let preset_instance = temps_presets::get_preset_by_slug(&runtime_slug);
         let static_output_dir = preset_instance.as_ref().and_then(|p| p.static_output_dir());
 
         debug!(
             "Preset {} static output directory: {:?}",
-            project.preset, static_output_dir
+            runtime_slug, static_output_dir
         );
 
         // Job 2: Build container image (skip for static deployments)

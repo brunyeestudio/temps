@@ -371,7 +371,51 @@ mod tests {
         assert!(get_preset_by_slug("nextjs").is_some());
         assert!(get_preset_by_slug("vite").is_some());
         assert!(get_preset_by_slug("dockerfile").is_some());
+        assert!(get_preset_by_slug("nixpacks").is_some());
+        assert!(get_preset_by_slug("nixpacks-node").is_some());
+        assert!(get_preset_by_slug("nixpacks-python").is_some());
+        assert!(get_preset_by_slug("nixpacks-static").is_some());
         assert!(get_preset_by_slug("nonexistent").is_none());
+        assert!(get_preset_by_slug("nixpacks-not-a-real-provider").is_none());
+    }
+
+    #[test]
+    fn test_nixpacks_provider_slugs_roundtrip_with_entity_storage() {
+        use temps_entities::preset::Preset as EntityPreset;
+
+        // Every provider-specific slug listed by temps-presets must resolve for storage
+        // and round-trip back through runtime_slug.
+        for slug in [
+            "nixpacks",
+            "nixpacks-node",
+            "nixpacks-python",
+            "nixpacks-rust",
+            "nixpacks-go",
+            "nixpacks-java",
+            "nixpacks-php",
+            "nixpacks-ruby",
+            "nixpacks-deno",
+            "nixpacks-elixir",
+            "nixpacks-csharp",
+            "nixpacks-dart",
+            "nixpacks-static",
+        ] {
+            assert!(
+                get_preset_by_slug(slug).is_some(),
+                "temps-presets should register {slug}"
+            );
+            let (preset, nixpacks_provider) =
+                EntityPreset::resolve_storage_slug(slug).unwrap_or_else(|e| panic!("{slug}: {e}"));
+            assert_eq!(preset, EntityPreset::Nixpacks);
+            let config = nixpacks_provider.map(|provider| {
+                temps_entities::preset::PresetConfig::with_nixpacks_provider(None, provider)
+            });
+            assert_eq!(
+                preset.runtime_slug(config.as_ref()),
+                slug,
+                "storage round-trip for {slug}"
+            );
+        }
     }
 
     #[test]
@@ -389,6 +433,9 @@ mod tests {
         assert!(slugs.contains(&"go".to_string()));
         assert!(slugs.contains(&"python".to_string()));
         assert!(slugs.contains(&"rust".to_string()));
+        assert!(slugs.contains(&"nixpacks".to_string()));
+        assert!(slugs.contains(&"nixpacks-node".to_string()));
+        assert!(slugs.contains(&"nixpacks-python".to_string()));
     }
 
     #[test]
