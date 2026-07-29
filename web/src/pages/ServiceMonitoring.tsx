@@ -1347,6 +1347,8 @@ function MonitoringDashboard({
         />
       )}
 
+      {/* Slow queries moved to the dedicated Query Performance page */}
+
       {/* Alert rules */}
       <AlertRulesSection serviceId={serviceId} engine={engine} />
     </div>

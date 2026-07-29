@@ -1618,6 +1618,83 @@ temps services env-var --id 1 --project my-app --var DATABASE_URL
 | `--var <name>` | Environment variable name |
 | `--json` | Output in JSON format |
 
+### Service Logs
+
+`services logs` — fetch and display the persisted log history for an external service (Postgres, Redis, MongoDB, etc.). The logs are stored by the log-aggregator and searched via the same `/logs/search` pipeline used by the web UI. The time range defaults to the last 24 hours; use `--from`/`--to` to narrow or widen it.
+
+```bash
+# Default: last 24 hours for service 1
+bunx @temps-sdk/cli services logs --id 1
+
+# Relative time shorthands: 15m, 1h, 24h, 7d
+bunx @temps-sdk/cli services logs --id 1 --from 1h
+bunx @temps-sdk/cli services logs --id 1 --from 7d
+
+# Absolute ISO 8601 range
+bunx @temps-sdk/cli services logs --id 1 \
+  --from 2026-07-28T00:00:00Z --to 2026-07-28T06:00:00Z
+
+# Filter by level and text
+bunx @temps-sdk/cli services logs --id 1 --level ERROR,WARN --text "connection refused"
+
+# Tail more lines (default 200, max 1000)
+bunx @temps-sdk/cli services logs --id 1 --tail 500
+
+# Machine-readable JSON output (full SearchLogsResponse)
+bunx @temps-sdk/cli services logs --id 1 --json
+```
+
+| Option | Description |
+| --- | --- |
+| `--id <id>` | Service ID (required) |
+| `--from <datetime>` | Start of time range. ISO 8601 timestamp or relative shorthand: `15m`, `1h`, `24h`, `7d`. Default: 24 hours ago. |
+| `--to <datetime>` | End of time range. ISO 8601 timestamp. Default: now. |
+| `-l, --level <levels>` | Comma-separated log levels to include: `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`. |
+| `-n, --tail <lines>` | Maximum log lines to fetch (default: 200, max: 1000). |
+| `-t, --text <query>` | Case-insensitive text filter applied to log messages. |
+| `--json` | Output raw JSON (full `SearchLogsResponse` with `lines`, `next_cursor`, `total_scanned`). |
+
+### Service Slow Queries
+
+`services slow-queries` — fetch the slowest PostgreSQL queries recorded by `pg_stat_statements` for an external Postgres service. Queries are ranked by total execution time and support pagination. Requires the `pg_stat_statements` extension to be loaded via `shared_preload_libraries`; if it is not loaded, a clear error message is printed instead of a raw stack trace.
+
+```bash
+# Default: page 1, 20 rows per page for service 1
+bunx @temps-sdk/cli services slow-queries --id 1
+
+# Page 2 with 5 rows per page
+bunx @temps-sdk/cli services slow-queries --id 1 --page 2 --page-size 5
+
+# Machine-readable JSON output (full paginated SlowQueriesResponse)
+bunx @temps-sdk/cli services slow-queries --id 1 --json
+```
+
+| Option | Description |
+| --- | --- |
+| `--id <id>` | Service ID (required) |
+| `--page <n>` | Page number, 1-based (default: 1). |
+| `--page-size <n>` | Rows per page (1–100, default: 20). |
+| `--json` | Output raw JSON (`{ queries: [...], page: N, page_size: N, total_count: N }`). |
+
+Table columns: **Query** (truncated at 60 chars), **Calls**, **Total Time (ms)**, **Mean Time (ms)**, **Rows**, **Cache Hit Ratio** (shown as `—` when null). Footer shows `page N / total` and total row count.
+
+### Enable pg_stat_statements
+
+`services enable-pg-stat-statements` — enable `pg_stat_statements` on a **standalone** Postgres service by restarting its container so `shared_preload_libraries=pg_stat_statements` takes effect. Only available for standalone services — clustered/HA services (`pg_auto_failover`) are rejected with a clear error, since a blind single-container restart bypasses controlled failover and needs a manual rolling restart instead. The container restart briefly drops active connections; a confirmation prompt is shown unless `--yes` is passed.
+
+```bash
+# Prompts for confirmation before restarting
+bunx @temps-sdk/cli services enable-pg-stat-statements --id 1
+
+# Skip the confirmation prompt (for automation/scripts)
+bunx @temps-sdk/cli services enable-pg-stat-statements --id 1 --yes
+```
+
+| Option | Description |
+| --- | --- |
+| `--id <id>` | Service ID (required) |
+| `-y, --yes` | Skip the restart confirmation prompt. |
+
 ### Backups & Restore
 
 Inspect a service's restore capabilities, browse backups stored on an S3 source, and restore in-place, into a new service, or via point-in-time recovery (PITR). PITR requires a WAL-G backup (PostgreSQL).
