@@ -4,6 +4,7 @@
 //! These schemas are used in the API and validated when creating/updating projects.
 
 use serde::{Deserialize, Serialize};
+use temps_entities::preset::NixpacksProvider;
 
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
@@ -28,17 +29,19 @@ pub struct DockerfilePresetConfig {
 }
 
 /// Configuration for Nixpacks preset
-/// Nixpacks auto-detects your application and uses nixpacks.toml for configuration
-/// No additional parameters needed - configuration is expressed in nixpacks.toml file
+/// Nixpacks provider and inline build-plan configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct NixpacksPresetConfig {
-    /// This preset uses nixpacks.toml for configuration
-    /// Place a nixpacks.toml file in your project directory with your settings
-    /// See: https://nixpacks.com/docs/configuration/file
-    #[serde(skip)]
-    _marker: (),
+    /// Optional inline nixpacks.toml contents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nixpacks_config: Option<String>,
+
+    /// Ordered Nixpacks providers. Empty means repository config or auto-detect;
+    /// include `...` to combine auto-detection with explicit providers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<NixpacksProvider>,
 }
 
 /// Configuration for static site presets (Vite, Next.js, Docusaurus, etc.)
@@ -78,7 +81,7 @@ pub struct StaticPresetConfig {
 pub enum PresetConfigSchema {
     /// Configuration for Dockerfile preset
     Dockerfile(DockerfilePresetConfig),
-    /// Configuration for Nixpacks preset (uses nixpacks.toml, no params needed)
+    /// Configuration for Nixpacks provider selection and inline build plan
     Nixpacks(NixpacksPresetConfig),
     /// Configuration for static site presets (Vite, Next.js, etc.)
     Static(StaticPresetConfig),
@@ -133,6 +136,21 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["installCommand"], "bun install");
         assert_eq!(json["buildCommand"], "bun run build");
+    }
+
+    #[test]
+    fn test_nixpacks_config_serialization() {
+        let config = NixpacksPresetConfig {
+            nixpacks_config: Some("[start]\ncmd = \"python main.py\"".to_string()),
+            providers: vec![NixpacksProvider::Auto, NixpacksProvider::Python],
+        };
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["providers"], serde_json::json!(["...", "python"]));
+        assert_eq!(
+            json["nixpacksConfig"],
+            "[start]\ncmd = \"python main.py\""
+        );
     }
 
     #[test]

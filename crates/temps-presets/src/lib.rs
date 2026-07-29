@@ -14,8 +14,9 @@ mod mod_rs {
 // Re-export main types for easy access
 pub use {
     all_presets, detect_all_presets_from_files, detect_node_framework, detect_preset_from_files,
-    get_preset_by_slug, DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider,
-    NodeFramework, PackageManager, Preset, PresetConfig, ProjectType,
+    get_preset_by_slug, get_preset_for_storage, resolve_preset_slug, runtime_slug,
+    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework,
+    PackageManager, Preset, PresetConfig, PresetResolutionError, ProjectType, StoredPreset,
 };
 
 #[cfg(test)]
@@ -380,42 +381,100 @@ mod tests {
     }
 
     #[test]
-    fn test_nixpacks_provider_slugs_roundtrip_with_entity_storage() {
-        use temps_entities::preset::Preset as EntityPreset;
-
-        // Every provider-specific slug listed by temps-presets must resolve for storage
-        // and round-trip back through runtime_slug.
-        for slug in [
-            "nixpacks",
-            "nixpacks-node",
-            "nixpacks-python",
-            "nixpacks-rust",
-            "nixpacks-go",
-            "nixpacks-java",
-            "nixpacks-php",
-            "nixpacks-ruby",
-            "nixpacks-deno",
-            "nixpacks-elixir",
-            "nixpacks-csharp",
-            "nixpacks-dart",
-            "nixpacks-static",
-        ] {
+    fn test_every_public_catalog_preset_roundtrips_through_storage() {
+        for catalog_preset in all_presets() {
+            let slug = catalog_preset.slug();
+            let stored = catalog_preset
+                .resolve_storage(None)
+                .unwrap_or_else(|error| panic!("{slug} is not persistable: {error}"));
             assert!(
-                get_preset_by_slug(slug).is_some(),
-                "temps-presets should register {slug}"
+                get_preset_for_storage(stored.preset, stored.config.as_ref())
+                    .unwrap_or_else(|error| panic!("{slug} cannot be restored: {error}"))
+                    .is_some(),
+                "{slug} cannot be restored for deployment"
             );
-            let (preset, nixpacks_provider) =
-                EntityPreset::resolve_storage_slug(slug).unwrap_or_else(|e| panic!("{slug}: {e}"));
-            assert_eq!(preset, EntityPreset::Nixpacks);
-            let config = nixpacks_provider.map(|provider| {
-                temps_entities::preset::PresetConfig::with_nixpacks_provider(None, provider)
-            });
             assert_eq!(
-                preset.runtime_slug(config.as_ref()),
+                runtime_slug(stored.preset, stored.config.as_ref()),
                 slug,
-                "storage round-trip for {slug}"
+                "catalog/storage round-trip for {slug}"
             );
         }
+    }
+
+    #[test]
+    fn test_nixpacks_multi_provider_config_uses_canonical_runtime_slug() {
+        use temps_entities::preset::{
+            NixpacksConfig, NixpacksProvider, Preset as EntityPreset,
+            PresetConfig as EntityPresetConfig,
+        };
+
+        let config = EntityPresetConfig::Nixpacks(NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::Auto, NixpacksProvider::Python],
+        });
+        let stored = resolve_preset_slug("nixpacks", Some(config)).unwrap();
+
+        assert_eq!(stored.preset, EntityPreset::Nixpacks);
+        assert_eq!(
+            runtime_slug(stored.preset, stored.config.as_ref()),
+            "nixpacks"
+        );
+    }
+
+    #[test]
+    fn test_nixpacks_provider_without_catalog_variant_uses_canonical_runtime_slug() {
+        use temps_entities::preset::{
+            NixpacksConfig, NixpacksProvider, Preset as EntityPreset,
+            PresetConfig as EntityPresetConfig,
+        };
+
+        let config = EntityPresetConfig::Nixpacks(NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::FSharp],
+        });
+
+        assert_eq!(
+            runtime_slug(EntityPreset::Nixpacks, Some(&config)),
+            "nixpacks"
+        );
+    }
+
+    #[test]
+    fn test_nixpacks_variant_overrides_existing_provider_and_preserves_config() {
+        use temps_entities::preset::{
+            NixpacksConfig, NixpacksProvider, PresetConfig as EntityPresetConfig,
+        };
+
+        let existing = EntityPresetConfig::Nixpacks(NixpacksConfig {
+            nixpacks_config: Some("[start]\ncmd = \"python main.py\"".to_string()),
+            providers: vec![NixpacksProvider::Node],
+        });
+        let stored = resolve_preset_slug("nixpacks-python", Some(existing)).unwrap();
+
+        match stored.config {
+            Some(EntityPresetConfig::Nixpacks(config)) => {
+                assert_eq!(config.providers, vec![NixpacksProvider::Python]);
+                assert_eq!(
+                    config.nixpacks_config.as_deref(),
+                    Some("[start]\ncmd = \"python main.py\"")
+                );
+            }
+            other => panic!("expected Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nixpacks_invalid_inline_toml_is_rejected_before_storage() {
+        use temps_entities::preset::{NixpacksConfig, PresetConfig as EntityPresetConfig};
+
+        let config = EntityPresetConfig::Nixpacks(NixpacksConfig {
+            nixpacks_config: Some("invalid = [".to_string()),
+            providers: Vec::new(),
+        });
+        let error = resolve_preset_slug("nixpacks", Some(config)).unwrap_err();
+
+        assert!(matches!(error, PresetResolutionError::InvalidConfig { .. }));
+        assert!(error.to_string().contains("failed to parse Nixpacks TOML"));
     }
 
     #[test]

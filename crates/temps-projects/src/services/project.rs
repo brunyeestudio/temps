@@ -17,7 +17,6 @@ use super::types::{
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
-use temps_presets::get_preset_by_slug;
 // Placeholder functions - these should be implemented properly or imported from other services
 
 fn slugify(name: &str) -> String {
@@ -71,74 +70,102 @@ pub const DEFAULT_MEMORY_LIMIT: i32 = 512; // 512 MB (small hosted website profi
 // Add these constants at the top of the file proper key management
 pub const NONCE_LENGTH: usize = 12;
 
-/// Validate against the closed preset registry, then map API/UI slugs to the
-/// persistable enum + optional Nixpacks provider key.
+/// Resolve an API/UI catalog slug to its canonical persisted preset and config.
 fn resolve_preset_slug(
     slug: &str,
-) -> Result<(temps_entities::preset::Preset, Option<Option<String>>), ProjectError> {
-    let _ = get_preset_by_slug(slug)
-        .ok_or_else(|| ProjectError::InvalidInput(format!("Invalid preset: {}", slug)))?;
-    temps_entities::preset::Preset::resolve_storage_slug(slug).map_err(ProjectError::InvalidInput)
+    config: Option<temps_entities::preset::PresetConfig>,
+) -> Result<temps_presets::StoredPreset, ProjectError> {
+    temps_presets::resolve_preset_slug(slug, config)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset: {}", error)))
 }
 
-/// Apply a resolved preset onto an ActiveModel, writing Nixpacks provider into
-/// `preset_config` or clearing a stale/mismatched config when leaving Nixpacks
-/// (or switching to a different preset family).
+/// Apply a canonical preset selection to a project update.
 fn apply_resolved_preset(
     active: &mut projects::ActiveModel,
-    preset: temps_entities::preset::Preset,
-    nixpacks_provider: Option<Option<String>>,
-    existing: Option<temps_entities::preset::PresetConfig>,
+    resolved: temps_presets::StoredPreset,
 ) {
-    use temps_entities::preset::PresetConfig;
-
-    active.preset = Set(preset);
-    match nixpacks_provider {
-        Some(provider) => {
-            active.preset_config = Set(Some(PresetConfig::with_nixpacks_provider(
-                existing, provider,
-            )));
-        }
-        None => {
-            let should_clear = match &existing {
-                Some(PresetConfig::Nixpacks(_)) => true,
-                Some(cfg) if cfg.preset_type() != preset => true,
-                _ => false,
-            };
-            if should_clear {
-                active.preset_config = Set(None);
-            }
-        }
-    }
+    active.preset = Set(resolved.preset);
+    active.preset_config = Set(resolved.config);
 }
 
-/// After `parse_for_preset`, preserve an existing Nixpacks `provider` when the
-/// incoming JSON omits the `provider` key (partial PATCH). Explicit
-/// `"provider": null` still clears it.
-fn merge_preset_config_preserving_provider(
+/// Preserve an existing Nixpacks provider selection when a partial config
+/// patch omits the `providers` field. An explicit empty list resets to auto.
+fn merge_preset_config(
     existing: Option<&temps_entities::preset::PresetConfig>,
     parsed: temps_entities::preset::PresetConfig,
     config_value: &serde_json::Value,
+    preserve_omitted_providers: bool,
 ) -> temps_entities::preset::PresetConfig {
     use temps_entities::preset::PresetConfig;
 
-    let omits_provider = config_value
+    let omits_providers = config_value
         .as_object()
-        .map(|m| !m.contains_key("provider"))
+        .map(|map| !map.contains_key("providers"))
         .unwrap_or(true);
 
-    match (existing, parsed, omits_provider) {
+    match (
+        existing,
+        parsed,
+        omits_providers && preserve_omitted_providers,
+    ) {
         (
             Some(PresetConfig::Nixpacks(existing_cfg)),
             PresetConfig::Nixpacks(mut parsed_cfg),
             true,
         ) => {
-            if parsed_cfg.provider.is_none() && existing_cfg.provider.is_some() {
-                parsed_cfg.provider = existing_cfg.provider.clone();
+            if parsed_cfg.providers.is_empty() && !existing_cfg.providers.is_empty() {
+                parsed_cfg.providers = existing_cfg.providers.clone();
             }
             PresetConfig::Nixpacks(parsed_cfg)
         }
         (_, other, _) => other,
+    }
+}
+
+/// Resolve an explicit catalog selection for create/update.
+///
+/// Existing config is retained when it belongs to the same canonical preset.
+/// Selecting base `nixpacks` is authoritative: omitted providers reset to
+/// auto-detection while other Nixpacks settings remain intact.
+fn resolve_preset_selection(
+    slug: &str,
+    config_value: Option<&serde_json::Value>,
+    existing: Option<&temps_entities::preset::PresetConfig>,
+) -> Result<temps_presets::StoredPreset, ProjectError> {
+    use temps_entities::preset::PresetConfig;
+
+    let base_selection = resolve_preset_slug(slug, None)?;
+    let compatible_existing =
+        existing.filter(|config| config.preset_type() == base_selection.preset);
+
+    let config = match config_value {
+        Some(value) => {
+            let parsed =
+                PresetConfig::parse_for_preset(&base_selection.preset, value).map_err(|error| {
+                    ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+                })?;
+            Some(merge_preset_config(
+                compatible_existing,
+                parsed,
+                value,
+                slug != "nixpacks",
+            ))
+        }
+        None => {
+            let mut config = compatible_existing.cloned();
+            if slug == "nixpacks" {
+                if let Some(PresetConfig::Nixpacks(nixpacks)) = config.as_mut() {
+                    nixpacks.providers.clear();
+                }
+            }
+            config
+        }
+    };
+
+    if config.is_some() {
+        resolve_preset_slug(slug, config)
+    } else {
+        Ok(base_selection)
     }
 }
 
@@ -217,29 +244,13 @@ impl ProjectService {
         };
 
         let project_slug = self.generate_unique_project_slug(&request.name).await?;
-        // Persist plain Preset::Nixpacks for provider-specific nixpacks-* slugs;
-        // the provider key lives on NixpacksConfig.
-        let (preset, nixpacks_provider) = resolve_preset_slug(request.preset.as_str())?;
-
-        // Parse preset_config from JSON if provided
-        let mut preset_config: Option<temps_entities::preset::PresetConfig> = request
-            .preset_config
-            .map(|json_value| {
-                temps_entities::preset::PresetConfig::parse_for_preset(&preset, &json_value)
-                    .map_err(|e| {
-                        ProjectError::InvalidInput(format!("Invalid preset_config: {}", e))
-                    })
-            })
-            .transpose()?;
-
-        if let Some(provider) = nixpacks_provider {
-            preset_config = Some(
-                temps_entities::preset::PresetConfig::with_nixpacks_provider(
-                    preset_config,
-                    provider,
-                ),
-            );
-        }
+        let resolved = resolve_preset_selection(
+            request.preset.as_str(),
+            request.preset_config.as_ref(),
+            None,
+        )?;
+        let preset = resolved.preset;
+        let preset_config = resolved.config;
 
         // Create deployment config with resource and deployment settings.
         // New hosted websites get the conservative "small" profile by default:
@@ -766,8 +777,11 @@ impl ProjectService {
             normalized_directory
         };
 
-        let (preset, nixpacks_provider) = resolve_preset_slug(request.preset.as_str())?;
-        let existing_preset_config = project.preset_config.clone();
+        let resolved = resolve_preset_selection(
+            request.preset.as_str(),
+            request.preset_config.as_ref(),
+            project.preset_config.as_ref(),
+        )?;
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
@@ -777,12 +791,7 @@ impl ProjectService {
             Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
         active_project.directory = Set(normalized_directory);
         active_project.main_branch = Set(request.main_branch);
-        apply_resolved_preset(
-            &mut active_project,
-            preset,
-            nixpacks_provider,
-            existing_preset_config,
-        );
+        apply_resolved_preset(&mut active_project, resolved);
         active_project.updated_at = Set(chrono::Utc::now());
 
         let project_found = active_project.update(self.db.as_ref()).await?;
@@ -1169,39 +1178,13 @@ impl ProjectService {
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update preset_config if provided
-        if let Some(ref config_value) = preset_config {
-            // Reload project to ensure we have the latest state
-            let project = projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or(ProjectError::NotFound(format!(
-                    "Project {} not found",
-                    project_id
-                )))?;
-
-            let existing_config = project.preset_config.clone();
-            let parsed_config = temps_entities::preset::PresetConfig::parse_for_preset(
-                &project.preset,
-                config_value,
-            )
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset config: {}", e)))?;
-            let merged = merge_preset_config_preserving_provider(
-                existing_config.as_ref(),
-                parsed_config,
-                config_value,
-            );
-
-            let mut active_project: projects::ActiveModel = project.into();
-            active_project.preset_config = Set(Some(merged));
-            active_project.update(self.db.as_ref()).await?;
-        }
-
-        // Update git-related fields if any are provided
+        // Update git-related fields and preset configuration atomically so a
+        // config submitted with a new preset is parsed against that new preset.
         let needs_git_update = main_branch.is_some()
             || repo_owner.is_some()
             || repo_name.is_some()
             || preset.is_some()
+            || preset_config.is_some()
             || directory.is_some();
 
         if needs_git_update {
@@ -1227,13 +1210,27 @@ impl ProjectService {
                 active_project.repo_name = Set(name);
             }
             if let Some(preset_value) = preset {
-                let (preset_enum, nixpacks_provider) = resolve_preset_slug(preset_value.as_str())?;
-                apply_resolved_preset(
-                    &mut active_project,
-                    preset_enum,
-                    nixpacks_provider,
-                    existing_preset_config,
+                let resolved = resolve_preset_selection(
+                    preset_value.as_str(),
+                    preset_config.as_ref(),
+                    existing_preset_config.as_ref(),
+                )?;
+                apply_resolved_preset(&mut active_project, resolved);
+            } else if let Some(config_value) = preset_config.as_ref() {
+                let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
+                    active_project.preset.as_ref(),
+                    config_value,
+                )
+                .map_err(|error| {
+                    ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+                })?;
+                let merged = merge_preset_config(
+                    existing_preset_config.as_ref(),
+                    parsed,
+                    config_value,
+                    true,
                 );
+                active_project.preset_config = Set(Some(merged));
             }
             if let Some(dir) = directory {
                 active_project.directory = Set(dir);
@@ -1400,13 +1397,23 @@ impl ProjectService {
         active_project.source_type = Set(temps_entities::source_type::SourceType::Git);
 
         if let Some(preset_value) = preset {
-            let (preset_enum, nixpacks_provider) = resolve_preset_slug(preset_value.as_str())?;
-            apply_resolved_preset(
-                &mut active_project,
-                preset_enum,
-                nixpacks_provider,
-                existing_preset_config.clone(),
-            );
+            let resolved = resolve_preset_selection(
+                preset_value.as_str(),
+                preset_config.as_ref(),
+                existing_preset_config.as_ref(),
+            )?;
+            apply_resolved_preset(&mut active_project, resolved);
+        } else if let Some(config_value) = preset_config.as_ref() {
+            let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
+                &project_preset,
+                config_value,
+            )
+            .map_err(|error| {
+                ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+            })?;
+            let merged =
+                merge_preset_config(existing_preset_config.as_ref(), parsed, config_value, true);
+            active_project.preset_config = Set(Some(merged));
         }
 
         // Determine the effective new connection id and whether we need to handle
@@ -1441,37 +1448,6 @@ impl ProjectService {
 
         if let Some(is_public) = is_public_repo {
             active_project.is_public_repo = Set(is_public);
-        }
-
-        // Update preset_config if provided (e.g., Dockerfile path for Docker preset)
-        if let Some(ref config_value) = preset_config {
-            // Determine the target preset: use the newly set preset if provided, otherwise use current
-            let target_preset = if active_project.preset.is_set() {
-                *active_project.preset.as_ref()
-            } else {
-                project_preset
-            };
-
-            // Prefer the ActiveModel's existing config when a prior apply_resolved_preset
-            // already wrote one in this request; otherwise the pre-update snapshot.
-            let existing_for_merge = if active_project.preset_config.is_set() {
-                active_project.preset_config.as_ref().clone()
-            } else {
-                existing_preset_config.clone()
-            };
-
-            let parsed_config = temps_entities::preset::PresetConfig::parse_for_preset(
-                &target_preset,
-                config_value,
-            )
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset config: {}", e)))?;
-            let merged = merge_preset_config_preserving_provider(
-                existing_for_merge.as_ref(),
-                parsed_config,
-                config_value,
-            );
-
-            active_project.preset_config = Set(Some(merged));
         }
 
         // ── GitLab webhook lifecycle ──────────────────────────────────────────
@@ -2556,9 +2532,8 @@ impl ProjectService {
         let deployment_config = db_project.deployment_config.clone();
 
         // Convert preset to the runtime/UI slug (reconstructs nixpacks-{provider})
-        let preset_str = db_project
-            .preset
-            .runtime_slug(db_project.preset_config.as_ref());
+        let preset_str =
+            temps_presets::runtime_slug(db_project.preset, db_project.preset_config.as_ref());
 
         // Handle repo_name and repo_owner - return None for empty strings (Git-less projects)
         let repo_name = if db_project.repo_name.is_empty() {
@@ -3367,10 +3342,12 @@ mod tests {
 
         match row.preset_config {
             Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
-                assert_eq!(cfg.provider.as_deref(), Some("node"));
-                assert_eq!(cfg.slug(), "nixpacks-node");
+                assert_eq!(
+                    cfg.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
             }
-            other => panic!("expected Nixpacks preset_config with provider=node, got {other:?}"),
+            other => panic!("expected Nixpacks preset_config with providers=[node], got {other:?}"),
         }
     }
 
@@ -3389,7 +3366,9 @@ mod tests {
         request.preset = "nixpacks-not-a-real-provider".to_string();
 
         match project_service.create_project(request).await {
-            Err(ProjectError::InvalidInput(_)) => {}
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("nixpacks-not-a-real-provider"));
+            }
             Err(other) => panic!("expected InvalidInput, got {other:?}"),
             Ok(_) => panic!("unknown nixpacks provider slug must be rejected"),
         }
@@ -3437,7 +3416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_partial_preset_config_patch_preserves_nixpacks_provider() {
+    async fn test_partial_preset_config_patch_preserves_nixpacks_providers() {
         if !docker_available().await {
             println!("Docker not available, skipping");
             return;
@@ -3490,16 +3469,18 @@ mod tests {
             .expect("project row");
         match row.preset_config {
             Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
-                assert_eq!(cfg.provider.as_deref(), Some("node"));
+                assert_eq!(
+                    cfg.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
                 assert_eq!(cfg.nixpacks_config.as_deref(), Some(toml));
-                assert_eq!(cfg.slug(), "nixpacks-node");
             }
-            other => panic!("expected Nixpacks config with provider=node, got {other:?}"),
+            other => panic!("expected Nixpacks config with providers=[node], got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn test_explicit_provider_null_clears_nixpacks_provider() {
+    async fn test_explicit_empty_providers_resets_nixpacks_to_auto() {
         if !docker_available().await {
             println!("Docker not available, skipping");
             return;
@@ -3531,7 +3512,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(serde_json::json!({ "provider": null })),
+                Some(serde_json::json!({ "providers": [] })),
                 None,
                 None,
                 None,
@@ -3540,7 +3521,7 @@ mod tests {
                 None,
             )
             .await
-            .expect("explicit provider null");
+            .expect("explicit empty providers");
 
         assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
 
@@ -3551,10 +3532,291 @@ mod tests {
             .expect("project row");
         match row.preset_config {
             Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
-                assert!(cfg.provider.is_none());
-                assert_eq!(cfg.slug(), "nixpacks");
+                assert!(cfg.providers.is_empty());
             }
-            other => panic!("expected Nixpacks config without provider, got {other:?}"),
+            other => panic!("expected Nixpacks config without providers, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_project_base_nixpacks_resets_provider_and_preserves_toml() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let toml = "[start]\ncmd = \"npm start\"";
+        let mut create = create_request("Reset Through Full Update");
+        create.preset = "nixpacks-node".to_string();
+        create.preset_config = Some(serde_json::json!({ "nixpacksConfig": toml }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node project");
+
+        let mut update = create_request("Reset Through Full Update");
+        update.preset = "nixpacks".to_string();
+        let updated = project_service
+            .update_project(created.id, update)
+            .await
+            .expect("select base nixpacks");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert!(config.providers.is_empty());
+                assert_eq!(config.nixpacks_config.as_deref(), Some(toml));
+            }
+            other => panic!("expected base Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_config_rejects_unknown_provider() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Reject Invalid Provider"))
+            .await
+            .expect("create nixpacks project");
+
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "providers": ["not-real"] })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("not-real"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid provider must be rejected"),
+        }
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(project_service.db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert!(config.providers.is_empty());
+            }
+            other => panic!("expected unchanged Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_create() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+
+        let mut request = create_request("Invalid Nixpacks TOML");
+        request.preset_config = Some(serde_json::json!({ "nixpacksConfig": "invalid = [" }));
+        let result = project_service.create_project(request).await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_supports_multiple_ordered_providers() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Multiple Providers");
+        request.preset_config = Some(serde_json::json!({
+            "providers": ["...", "python"]
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create multi-provider Nixpacks project");
+
+        assert_eq!(created.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![
+                        temps_entities::preset::NixpacksProvider::Auto,
+                        temps_entities::preset::NixpacksProvider::Python,
+                    ]
+                );
+            }
+            other => panic!("expected multi-provider Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_settings_persist_multiple_ordered_nixpacks_providers() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Git Settings Providers"))
+            .await
+            .expect("create project");
+        let updated = project_service
+            .update_git_settings(
+                created.id,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                Some("nixpacks".to_string()),
+                ".".to_string(),
+                Some(serde_json::json!({ "providers": ["...", "python"] })),
+                None,
+                None,
+            )
+            .await
+            .expect("update git settings");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![
+                        temps_entities::preset::NixpacksProvider::Auto,
+                        temps_entities::preset::NixpacksProvider::Python,
+                    ]
+                );
+            }
+            other => panic!("expected multi-provider Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preset_and_config_update_use_effective_new_preset() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Atomic Preset Update");
+        request.preset = "nextjs".to_string();
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create nextjs project");
+
+        let toml = "[start]\ncmd = \"npm start\"";
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("nixpacks-node".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "nixpacksConfig": toml })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("update preset and config together");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
+                assert_eq!(config.nixpacks_config.as_deref(), Some(toml));
+            }
+            other => panic!("expected updated Nixpacks config, got {other:?}"),
         }
     }
 

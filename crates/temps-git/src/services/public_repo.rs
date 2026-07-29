@@ -663,9 +663,10 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
     detected
         .into_iter()
         .map(|preset| {
-            let preset_enum = temps_entities::preset::Preset::resolve_storage_slug(&preset.slug)
-                .ok()
-                .map(|(p, _)| p);
+            let runtime_preset = temps_presets::get_preset_by_slug(&preset.slug);
+            let preset_enum = runtime_preset
+                .as_ref()
+                .and_then(|preset| preset.stored_preset());
 
             // Prefer temps-presets metadata (covers nixpacks-* UI slugs); fall back to entity.
             let exposed_port = preset.exposed_port.map(|p| p as i32).or_else(|| {
@@ -675,8 +676,9 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
                     .map(|p| p as i32)
             });
 
-            let icon_url = temps_presets::get_preset_by_slug(&preset.slug)
-                .map(|p| p.icon_url())
+            let icon_url = runtime_preset
+                .as_ref()
+                .map(|preset| preset.icon_url())
                 .or_else(|| {
                     preset_enum
                         .as_ref()
@@ -684,8 +686,9 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
                         .map(|s| s.to_string())
                 });
 
-            let project_type = temps_presets::get_preset_by_slug(&preset.slug)
-                .map(|p| p.project_type().to_string())
+            let project_type = runtime_preset
+                .as_ref()
+                .map(|preset| preset.project_type().to_string())
                 .or_else(|| preset_enum.as_ref().map(|p| p.project_type().to_string()))
                 .unwrap_or_else(|| "unknown".to_string());
 

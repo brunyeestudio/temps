@@ -127,39 +127,7 @@ pub enum Preset {
 }
 
 impl Preset {
-    /// Resolve an API/UI preset slug into the persistable enum + optional Nixpacks provider key.
-    ///
-    /// Provider-specific slugs (`nixpacks-node`, …) map to [`Preset::Nixpacks`] with
-    /// the provider suffix stored on [`NixpacksConfig::provider`]. Validity of the
-    /// slug itself (closed set) is enforced by callers via `get_preset_by_slug`.
-    ///
-    /// Returns `(preset, nixpacks_provider)` where `nixpacks_provider` is:
-    /// - `None` for non-nixpacks presets
-    /// - `Some(None)` for auto `nixpacks`
-    /// - `Some(Some("node"))` for `nixpacks-node`, etc.
-    pub fn resolve_storage_slug(slug: &str) -> Result<(Preset, Option<Option<String>>), String> {
-        let lower = slug.to_lowercase();
-        if lower == "nixpacks" {
-            return Ok((Preset::Nixpacks, Some(None)));
-        }
-        if let Some(provider) = lower.strip_prefix("nixpacks-") {
-            if provider.is_empty() || provider == "auto" {
-                return Err(format!("Unknown preset: {}", slug));
-            }
-            return Ok((Preset::Nixpacks, Some(Some(provider.to_string()))));
-        }
-        slug.parse::<Preset>().map(|p| (p, None))
-    }
-
-    /// Runtime/UI slug, reconstructing `nixpacks-{provider}` when configured.
-    pub fn runtime_slug(&self, config: Option<&PresetConfig>) -> String {
-        match (self, config) {
-            (Preset::Nixpacks, Some(PresetConfig::Nixpacks(cfg))) => cfg.slug(),
-            (preset, _) => preset.as_str().to_string(),
-        }
-    }
-
-    /// Get the preset name as a string (persistable enum value, not UI slug).
+    /// Get the canonical persisted preset name.
     pub fn as_str(&self) -> &'static str {
         match self {
             Preset::NextJs => "nextjs",
@@ -892,6 +860,102 @@ pub struct ComposePublicPort {
     pub port: u16,
 }
 
+/// A Nixpacks build provider.
+///
+/// `Auto` serializes as the native Nixpacks `...` marker, which includes the
+/// provider detected from the project alongside any explicitly listed
+/// providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NixpacksProvider {
+    #[serde(rename = "...", alias = "auto")]
+    Auto,
+    Node,
+    Python,
+    Rust,
+    Go,
+    Java,
+    Php,
+    Ruby,
+    Deno,
+    Elixir,
+    CSharp,
+    FSharp,
+    Dart,
+    Swift,
+    Zig,
+    Scala,
+    Haskell,
+    Clojure,
+    Crystal,
+    Cobol,
+    Gleam,
+    Lunatic,
+    Scheme,
+    Static,
+}
+
+impl NixpacksProvider {
+    /// Provider identifier expected by Nixpacks build plans.
+    pub fn nixpacks_name(self) -> &'static str {
+        match self {
+            Self::Auto => "...",
+            Self::Node => "node",
+            Self::Python => "python",
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::Php => "php",
+            Self::Ruby => "ruby",
+            Self::Deno => "deno",
+            Self::Elixir => "elixir",
+            Self::CSharp => "c#",
+            Self::FSharp => "f#",
+            Self::Dart => "dart",
+            Self::Swift => "swift",
+            Self::Zig => "zig",
+            Self::Scala => "scala",
+            Self::Haskell => "haskell",
+            Self::Clojure => "clojure",
+            Self::Crystal => "crystal",
+            Self::Cobol => "cobol",
+            Self::Gleam => "gleam",
+            Self::Lunatic => "lunatic",
+            Self::Scheme => "scheme",
+            Self::Static => "staticfile",
+        }
+    }
+
+    pub fn variant_slug(self) -> &'static str {
+        match self {
+            Self::Auto => "nixpacks",
+            Self::Node => "nixpacks-node",
+            Self::Python => "nixpacks-python",
+            Self::Rust => "nixpacks-rust",
+            Self::Go => "nixpacks-go",
+            Self::Java => "nixpacks-java",
+            Self::Php => "nixpacks-php",
+            Self::Ruby => "nixpacks-ruby",
+            Self::Deno => "nixpacks-deno",
+            Self::Elixir => "nixpacks-elixir",
+            Self::CSharp => "nixpacks-csharp",
+            Self::FSharp => "nixpacks-fsharp",
+            Self::Dart => "nixpacks-dart",
+            Self::Swift => "nixpacks-swift",
+            Self::Zig => "nixpacks-zig",
+            Self::Scala => "nixpacks-scala",
+            Self::Haskell => "nixpacks-haskell",
+            Self::Clojure => "nixpacks-clojure",
+            Self::Crystal => "nixpacks-crystal",
+            Self::Cobol => "nixpacks-cobol",
+            Self::Gleam => "nixpacks-gleam",
+            Self::Lunatic => "nixpacks-lunatic",
+            Self::Scheme => "nixpacks-scheme",
+            Self::Static => "nixpacks-static",
+        }
+    }
+}
+
 /// Nixpacks preset configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
@@ -900,34 +964,13 @@ pub struct NixpacksConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nixpacks_config: Option<String>,
 
-    /// Language/provider key for provider-specific Nixpacks slugs.
+    /// Ordered providers used to create the Nixpacks plan.
     ///
-    /// - `None` / omitted → auto-detect (`nixpacks`)
-    /// - `Some("node")` → `nixpacks-node`, `Some("python")` → `nixpacks-python`, etc.
-    ///
-    /// The closed set of valid keys lives in `temps-presets::NixpacksProvider`;
-    /// this field only stores the suffix so the entity enum stays a single
-    /// [`Preset::Nixpacks`] variant.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-}
-
-impl NixpacksConfig {
-    /// Runtime/UI slug reconstructed from the optional provider key.
-    pub fn slug(&self) -> String {
-        match self.provider.as_deref() {
-            Some(p) if !p.is_empty() && p != "auto" => format!("nixpacks-{}", p),
-            _ => "nixpacks".to_string(),
-        }
-    }
-
-    /// Build config for a given provider key (`None` = auto-detect).
-    pub fn with_provider(provider: Option<String>) -> Self {
-        Self {
-            nixpacks_config: None,
-            provider,
-        }
-    }
+    /// An empty list delegates provider selection to the repository config or
+    /// Nixpacks auto-detection. Include `...` to combine auto-detection with
+    /// explicitly selected providers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<NixpacksProvider>,
 }
 
 /// Static site preset configuration
@@ -1061,21 +1104,6 @@ impl PresetConfig {
             .map_err(|e| format!("Failed to parse preset config for '{}': {}", preset_tag, e))
     }
 
-    /// Apply a Nixpacks provider key onto an existing config (or create one).
-    ///
-    /// Preserves other `NixpacksConfig` fields when the existing config is already Nixpacks.
-    pub fn with_nixpacks_provider(
-        existing: Option<PresetConfig>,
-        provider: Option<String>,
-    ) -> PresetConfig {
-        let mut cfg = match existing {
-            Some(PresetConfig::Nixpacks(c)) => c,
-            _ => NixpacksConfig::default(),
-        };
-        cfg.provider = provider;
-        PresetConfig::Nixpacks(cfg)
-    }
-
     /// Get the preset type from this configuration
     pub fn preset_type(&self) -> Preset {
         match self {
@@ -1140,198 +1168,85 @@ mod tests {
         assert_eq!(Preset::from_str("NextJs").unwrap(), Preset::NextJs);
         assert_eq!(Preset::from_str("nodejs").unwrap(), Preset::NodeJs);
         assert_eq!(Preset::from_str("node").unwrap(), Preset::NodeJs);
-        // Provider-specific nixpacks slugs are not enum variants — use resolve_storage_slug.
+        // Catalog variants are not database enum values.
         assert!(Preset::from_str("nixpacks-node").is_err());
         assert!(Preset::from_str("nixpacks-python").is_err());
         assert!(Preset::from_str("invalid").is_err());
     }
 
     #[test]
-    fn test_resolve_storage_slug_nixpacks_auto() {
-        let (preset, provider) = Preset::resolve_storage_slug("nixpacks").unwrap();
-        assert_eq!(preset, Preset::Nixpacks);
-        assert_eq!(provider, Some(None));
-
-        let (preset, provider) = Preset::resolve_storage_slug("NIXPACKS").unwrap();
-        assert_eq!(preset, Preset::Nixpacks);
-        assert_eq!(provider, Some(None));
-    }
-
-    #[test]
-    fn test_resolve_storage_slug_nixpacks_providers() {
-        for (slug, key) in [
-            ("nixpacks-node", "node"),
-            ("nixpacks-python", "python"),
-            ("nixpacks-rust", "rust"),
-            ("nixpacks-go", "go"),
-            ("nixpacks-java", "java"),
-            ("nixpacks-php", "php"),
-            ("nixpacks-ruby", "ruby"),
-            ("nixpacks-deno", "deno"),
-            ("nixpacks-elixir", "elixir"),
-            ("nixpacks-csharp", "csharp"),
-            ("nixpacks-dart", "dart"),
-            ("nixpacks-static", "static"),
-        ] {
-            let (preset, provider) = Preset::resolve_storage_slug(slug).unwrap_or_else(|e| {
-                panic!("expected {slug} to resolve: {e}");
-            });
-            assert_eq!(preset, Preset::Nixpacks, "slug={slug}");
-            assert_eq!(provider, Some(Some(key.to_string())), "slug={slug}");
-        }
-
-        // Case-insensitive provider slug
-        let (preset, provider) = Preset::resolve_storage_slug("Nixpacks-Node").unwrap();
-        assert_eq!(preset, Preset::Nixpacks);
-        assert_eq!(provider, Some(Some("node".to_string())));
-    }
-
-    #[test]
-    fn test_resolve_storage_slug_rejects_empty_nixpacks_provider() {
-        assert!(Preset::resolve_storage_slug("nixpacks-").is_err());
-        assert!(Preset::resolve_storage_slug("nixpacks-auto").is_err());
-    }
-
-    #[test]
-    fn test_resolve_storage_slug_non_nixpacks() {
-        let (preset, provider) = Preset::resolve_storage_slug("nextjs").unwrap();
-        assert_eq!(preset, Preset::NextJs);
-        assert_eq!(provider, None);
-
-        let (preset, provider) = Preset::resolve_storage_slug("dockerfile").unwrap();
-        assert_eq!(preset, Preset::Dockerfile);
-        assert_eq!(provider, None);
-
-        assert!(Preset::resolve_storage_slug("not-a-real-preset").is_err());
-    }
-
-    #[test]
-    fn test_nixpacks_config_slug_roundtrip() {
-        assert_eq!(NixpacksConfig::default().slug(), "nixpacks");
-        assert_eq!(NixpacksConfig::with_provider(None).slug(), "nixpacks");
+    fn test_nixpacks_provider_serialization_and_validation() {
         assert_eq!(
-            NixpacksConfig::with_provider(Some(String::new())).slug(),
-            "nixpacks"
+            serde_json::to_string(&NixpacksProvider::Auto).unwrap(),
+            "\"...\""
         );
         assert_eq!(
-            NixpacksConfig::with_provider(Some("auto".to_string())).slug(),
-            "nixpacks"
+            serde_json::from_str::<NixpacksProvider>("\"auto\"").unwrap(),
+            NixpacksProvider::Auto
         );
         assert_eq!(
-            NixpacksConfig::with_provider(Some("node".to_string())).slug(),
-            "nixpacks-node"
+            serde_json::from_str::<NixpacksProvider>("\"node\"").unwrap(),
+            NixpacksProvider::Node
         );
         assert_eq!(
-            NixpacksConfig::with_provider(Some("python".to_string())).slug(),
-            "nixpacks-python"
+            serde_json::to_string(&NixpacksProvider::CSharp).unwrap(),
+            "\"csharp\""
+        );
+        assert_eq!(NixpacksProvider::CSharp.nixpacks_name(), "c#");
+        assert_eq!(
+            serde_json::to_string(&NixpacksProvider::Static).unwrap(),
+            "\"static\""
+        );
+        assert_eq!(NixpacksProvider::Static.nixpacks_name(), "staticfile");
+        assert!(serde_json::from_str::<NixpacksProvider>("\"not-real\"").is_err());
+    }
+
+    #[test]
+    fn test_nixpacks_config_supports_ordered_multiple_providers() {
+        let config = NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::Auto, NixpacksProvider::Python],
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["providers"], serde_json::json!(["...", "python"]));
+        assert_eq!(
+            serde_json::from_value::<NixpacksConfig>(json).unwrap(),
+            config
         );
     }
 
     #[test]
-    fn test_runtime_slug_reconstructs_provider() {
-        let cfg = NixpacksConfig::with_provider(Some("node".to_string()));
+    fn test_legacy_nixpacks_config_defaults_to_auto_detection() {
+        let config: NixpacksConfig = serde_json::from_value(serde_json::json!({
+            "nixpacksConfig": "[start]\ncmd = \"npm start\""
+        }))
+        .unwrap();
+        assert!(config.providers.is_empty());
         assert_eq!(
-            Preset::Nixpacks.runtime_slug(Some(&PresetConfig::Nixpacks(cfg))),
-            "nixpacks-node"
-        );
-        assert_eq!(Preset::Nixpacks.runtime_slug(None), "nixpacks");
-        assert_eq!(
-            Preset::Nixpacks.runtime_slug(Some(&PresetConfig::Nixpacks(NixpacksConfig::default()))),
-            "nixpacks"
-        );
-        // Non-nixpacks configs ignore provider reconstruction
-        assert_eq!(
-            Preset::NextJs.runtime_slug(Some(&PresetConfig::NextJs(NextJsConfig::default()))),
-            "nextjs"
+            config.nixpacks_config.as_deref(),
+            Some("[start]\ncmd = \"npm start\"")
         );
     }
 
     #[test]
-    fn test_with_nixpacks_provider_preserves_toml_and_sets_provider() {
-        let existing = PresetConfig::Nixpacks(NixpacksConfig {
-            nixpacks_config: Some("[phases.setup]\nnixPkgs = [\"nodejs\"]".to_string()),
-            provider: None,
-        });
-
-        let updated =
-            PresetConfig::with_nixpacks_provider(Some(existing), Some("node".to_string()));
-        match updated {
-            PresetConfig::Nixpacks(cfg) => {
-                assert_eq!(
-                    cfg.nixpacks_config.as_deref(),
-                    Some("[phases.setup]\nnixPkgs = [\"nodejs\"]")
-                );
-                assert_eq!(cfg.provider.as_deref(), Some("node"));
-                assert_eq!(cfg.slug(), "nixpacks-node");
-            }
-            other => panic!("expected Nixpacks config, got {other:?}"),
-        }
-
-        // Switching from a non-nixpacks config replaces it
-        let from_dockerfile = PresetConfig::with_nixpacks_provider(
-            Some(PresetConfig::Dockerfile(DockerfileConfig::default())),
-            Some("python".to_string()),
-        );
-        match from_dockerfile {
-            PresetConfig::Nixpacks(cfg) => {
-                assert_eq!(cfg.provider.as_deref(), Some("python"));
-                assert!(cfg.nixpacks_config.is_none());
-            }
-            other => panic!("expected Nixpacks config, got {other:?}"),
-        }
-
-        // Auto (None provider) clears provider key
-        let auto = PresetConfig::with_nixpacks_provider(
-            Some(PresetConfig::Nixpacks(NixpacksConfig::with_provider(Some(
-                "node".to_string(),
-            )))),
-            None,
-        );
-        match auto {
-            PresetConfig::Nixpacks(cfg) => {
-                assert!(cfg.provider.is_none());
-                assert_eq!(cfg.slug(), "nixpacks");
-            }
-            other => panic!("expected Nixpacks config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_for_preset_nixpacks_with_provider() {
+    fn test_parse_for_preset_nixpacks_with_providers() {
         let value = serde_json::json!({
-            "provider": "node",
+            "providers": ["node", "python"],
             "nixpacksConfig": "[start]\ncmd = \"npm start\""
         });
         let config = PresetConfig::parse_for_preset(&Preset::Nixpacks, &value).unwrap();
         match config {
             PresetConfig::Nixpacks(cfg) => {
-                assert_eq!(cfg.provider.as_deref(), Some("node"));
+                assert_eq!(
+                    cfg.providers,
+                    vec![NixpacksProvider::Node, NixpacksProvider::Python]
+                );
                 assert_eq!(
                     cfg.nixpacks_config.as_deref(),
                     Some("[start]\ncmd = \"npm start\"")
                 );
-                assert_eq!(cfg.slug(), "nixpacks-node");
             }
             other => panic!("expected Nixpacks config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_resolve_then_runtime_slug_roundtrip() {
-        for slug in [
-            "nixpacks",
-            "nixpacks-node",
-            "nixpacks-python",
-            "nixpacks-static",
-        ] {
-            let (preset, nixpacks_provider) = Preset::resolve_storage_slug(slug).unwrap();
-            let config = nixpacks_provider
-                .map(|provider| PresetConfig::with_nixpacks_provider(None, provider));
-            assert_eq!(
-                preset.runtime_slug(config.as_ref()),
-                slug,
-                "round-trip failed for {slug}"
-            );
         }
     }
 

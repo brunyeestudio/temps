@@ -190,7 +190,7 @@ impl WorkflowExecutionService {
             .with("source_type", project.source_type.to_string())
             .with(
                 "preset",
-                project.preset.runtime_slug(project.preset_config.as_ref()),
+                temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
             )
             .with("is_preview", environment.is_preview),
         );
@@ -320,7 +320,7 @@ impl WorkflowExecutionService {
                     .with("source_type", project.source_type.to_string())
                     .with(
                         "preset",
-                        project.preset.runtime_slug(project.preset_config.as_ref()),
+                        temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
                     )
                     .with("is_preview", environment.is_preview),
                 );
@@ -333,7 +333,7 @@ impl WorkflowExecutionService {
                     .with("source_type", project.source_type.to_string())
                     .with(
                         "preset",
-                        project.preset.runtime_slug(project.preset_config.as_ref()),
+                        temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
                     ),
                 );
 
@@ -639,9 +639,9 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
-                // Pass runtime/UI slug (reconstructs nixpacks-{provider} when set)
-                let preset_str = project.preset.runtime_slug(project.preset_config.as_ref());
-                builder = builder.preset(preset_str);
+                builder = builder
+                    .preset(project.preset)
+                    .preset_config(project.preset_config.clone());
 
                 // Unseal build args from job_config. The planner derives build
                 // args from env vars and stores them encrypted (build_args
@@ -1822,7 +1822,10 @@ impl WorkflowExecutionService {
             {
                 Ok(Some(p)) => (
                     Some(p.source_type.to_string()),
-                    Some(p.preset.runtime_slug(p.preset_config.as_ref())),
+                    Some(temps_presets::runtime_slug(
+                        p.preset,
+                        p.preset_config.as_ref(),
+                    )),
                 ),
                 _ => (None, None),
             };
