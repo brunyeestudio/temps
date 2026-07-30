@@ -147,16 +147,33 @@ impl ScreenshotProvider for RemoteScreenshotProvider {
         "remote-api"
     }
 
-    async fn is_available(&self) -> bool {
+    async fn check_availability(&self) -> ScreenshotResult<()> {
         // Try a simple health check to the service URL
         let health_url = format!("{}/health", self.service_url.trim_end_matches('/'));
-        self.client
+        let response = self
+            .client
             .get(&health_url)
             .timeout(Duration::from_secs(5))
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+            .map_err(|e| {
+                ScreenshotError::ProviderError(format!(
+                    "Remote screenshot service health check failed for {}: {}. \
+                     Verify the service URL is correct and reachable from this server.",
+                    health_url, e
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(ScreenshotError::ProviderError(format!(
+                "Remote screenshot service health check for {} returned HTTP {}. \
+                 Verify the service is healthy and the API key is valid.",
+                health_url,
+                response.status()
+            )));
+        }
+
+        Ok(())
     }
 }
 

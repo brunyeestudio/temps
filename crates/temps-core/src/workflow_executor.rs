@@ -443,6 +443,54 @@ impl WorkflowExecutor {
         Ok(order)
     }
 
+    /// Record a terminal status for a job that never entered execution.
+    ///
+    /// Jobs that are skipped or fail prerequisite validation never reach the
+    /// batch-result handling in [`execute_workflow`](Self::execute_workflow), so
+    /// without this their tracker row keeps whatever status the planner created it
+    /// with (`Pending`) indefinitely. Tracker failures are logged and swallowed —
+    /// they must not take down the surrounding workflow.
+    async fn persist_terminal_status(
+        &self,
+        context: &WorkflowContext,
+        job_id: &str,
+        status: JobStatus,
+        message: Option<String>,
+    ) {
+        let Some(ref tracker) = self.job_tracker else {
+            return;
+        };
+
+        let execution_id = match tracker
+            .create_job_execution(&context.workflow_run_id, job_id, status.clone())
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                error!(
+                    "Failed to record terminal status {:?} for job '{}': {}",
+                    status, job_id, e
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = tracker
+            .update_job_status(execution_id, status.clone(), message)
+            .await
+        {
+            error!(
+                "Failed to update job '{}' (execution {}) to {:?}: {}",
+                job_id, execution_id, status, e
+            );
+        } else {
+            debug!(
+                "✅ Recorded terminal status {:?} for job '{}'",
+                status, job_id
+            );
+        }
+    }
+
     /// Execute a batch of jobs in parallel
     async fn execute_job_batch(
         &self,
@@ -463,6 +511,16 @@ impl WorkflowExecutor {
                 if job_state.job_config.job.should_skip(context).await? {
                     info!("⏭️ Skipping job: {}", job_id);
                     job_state.status = JobStatus::Skipped;
+                    // A job that never enters the batch results below must still reach a
+                    // terminal state in the tracker, or its pre-created row stays Pending
+                    // forever and the UI shows the step as still running.
+                    self.persist_terminal_status(
+                        context,
+                        &job_id,
+                        JobStatus::Skipped,
+                        Some("Job skipped: preconditions for running it were not met".to_string()),
+                    )
+                    .await;
                     continue;
                 }
 
@@ -476,11 +534,33 @@ impl WorkflowExecutor {
                     let error_msg = format!("Prerequisites not met for job '{}': {}", job_id, e);
                     error!("{}", error_msg);
 
+                    // Failed prerequisites are a real failure, not a silent skip — record
+                    // them as Failure with the reason so the operator can act on it. This
+                    // applies to optional jobs too: they are optional for *deployment
+                    // completion*, not exempt from reporting why they didn't run.
+                    job_state.status = JobStatus::Failure;
+                    self.persist_terminal_status(
+                        context,
+                        &job_id,
+                        JobStatus::Failure,
+                        Some(error_msg.clone()),
+                    )
+                    .await;
+
+                    if let Err(log_err) = context.log(&error_msg).await {
+                        error!(
+                            "Failed to log prerequisite failure for '{}': {}",
+                            job_id, log_err
+                        );
+                    }
+
                     if job_state.job_config.required && !continue_on_failure {
                         return Err(e);
                     } else {
-                        warn!("Skipping job '{}' due to failed prerequisites", job_id);
-                        job_state.status = JobStatus::Skipped;
+                        warn!(
+                            "Not running job '{}' due to failed prerequisites: {}",
+                            job_id, e
+                        );
                         continue;
                     }
                 }
@@ -844,5 +924,265 @@ mod tests {
         } else {
             panic!("Expected DependencyCycleDetected error");
         }
+    }
+
+    /// A job that never runs: either its prerequisites fail or it opts out via
+    /// `should_skip`. Mirrors `TakeScreenshotJob` when Chrome is missing.
+    #[derive(Debug)]
+    struct NonRunningJob {
+        id: String,
+        skip: bool,
+        prerequisite_error: Option<String>,
+        executed: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for NonRunningJob {
+        fn job_id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "Non-running job"
+        }
+
+        fn description(&self) -> &str {
+            "A job that is skipped or fails prerequisite validation"
+        }
+
+        async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            Ok(JobResult::success(context))
+        }
+
+        async fn should_skip(&self, _context: &WorkflowContext) -> Result<bool, WorkflowError> {
+            Ok(self.skip)
+        }
+
+        async fn validate_prerequisites(
+            &self,
+            _context: &WorkflowContext,
+        ) -> Result<(), WorkflowError> {
+            match &self.prerequisite_error {
+                Some(msg) => Err(WorkflowError::JobValidationFailed(msg.clone())),
+                None => Ok(()),
+            }
+        }
+
+        fn depends_on(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    /// Records every status the executor persists, keyed by job id.
+    #[derive(Default)]
+    struct RecordingJobTracker {
+        statuses: std::sync::Mutex<Vec<(String, JobStatus, Option<String>)>>,
+        ids: std::sync::Mutex<HashMap<i32, String>>,
+    }
+
+    impl RecordingJobTracker {
+        fn statuses_for(&self, job_id: &str) -> Vec<(JobStatus, Option<String>)> {
+            self.statuses
+                .lock()
+                .expect("statuses lock poisoned")
+                .iter()
+                .filter(|(id, _, _)| id == job_id)
+                .map(|(_, status, msg)| (status.clone(), msg.clone()))
+                .collect()
+        }
+
+        /// The status the deployment_jobs row would be left with.
+        fn final_status(&self, job_id: &str) -> Option<(JobStatus, Option<String>)> {
+            self.statuses_for(job_id).last().cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl JobTracker for RecordingJobTracker {
+        async fn create_job_execution(
+            &self,
+            _workflow_run_id: &str,
+            job_id: &str,
+            status: JobStatus,
+        ) -> Result<i32, WorkflowError> {
+            let mut ids = self.ids.lock().expect("ids lock poisoned");
+            let execution_id = ids.len() as i32 + 1;
+            ids.insert(execution_id, job_id.to_string());
+            self.statuses.lock().expect("statuses lock poisoned").push((
+                job_id.to_string(),
+                status,
+                None,
+            ));
+            Ok(execution_id)
+        }
+
+        async fn update_job_status(
+            &self,
+            job_execution_id: i32,
+            status: JobStatus,
+            message: Option<String>,
+        ) -> Result<(), WorkflowError> {
+            let job_id = self
+                .ids
+                .lock()
+                .expect("ids lock poisoned")
+                .get(&job_execution_id)
+                .cloned()
+                .ok_or_else(|| {
+                    WorkflowError::Other(format!("Unknown execution id {}", job_execution_id))
+                })?;
+            self.statuses
+                .lock()
+                .expect("statuses lock poisoned")
+                .push((job_id, status, message));
+            Ok(())
+        }
+
+        async fn add_job_logs(&self, _id: i32, _logs: Vec<String>) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        async fn mark_job_started(&self, _id: i32) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        async fn mark_job_finished(&self, _id: i32) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        async fn save_job_outputs(
+            &self,
+            _id: i32,
+            _outputs: serde_json::Value,
+        ) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        async fn cancel_pending_jobs(
+            &self,
+            _workflow_run_id: &str,
+            _reason: String,
+        ) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+    }
+
+    async fn run_with_tracker(
+        job: Arc<dyn WorkflowTask>,
+        required: bool,
+        continue_on_failure: bool,
+    ) -> (
+        Arc<RecordingJobTracker>,
+        Result<WorkflowContext, WorkflowError>,
+    ) {
+        let tracker = Arc::new(RecordingJobTracker::default());
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("test-workflow".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job_config(job, vec![], required)
+            .continue_on_failure(continue_on_failure)
+            .build()
+            .expect("workflow config should build");
+
+        let executor = WorkflowExecutor::new(Some(tracker.clone()));
+        let result = executor
+            .execute_workflow(
+                config,
+                Arc::new(TestCancellationProvider { cancelled: false }),
+            )
+            .await;
+
+        (tracker, result)
+    }
+
+    /// Regression test for #477: an optional job whose prerequisites fail (e.g.
+    /// `take_screenshot` on a server with no working Chrome) must be persisted as
+    /// Failure with the reason — previously only an in-memory status was set, so
+    /// the deployment_jobs row stayed Pending forever and the UI showed the step
+    /// as perpetually "generating".
+    #[tokio::test]
+    async fn test_optional_job_failing_prerequisites_is_persisted_as_failure() {
+        let executed = Arc::new(AtomicUsize::new(0));
+        let job = Arc::new(NonRunningJob {
+            id: "take_screenshot".to_string(),
+            skip: false,
+            prerequisite_error: Some(
+                "Screenshot provider 'local-headless-chrome' is not available: \
+                 Chrome browser error: Failed to launch Chrome browser"
+                    .to_string(),
+            ),
+            executed: executed.clone(),
+        });
+
+        let (tracker, result) = run_with_tracker(job, false, true).await;
+
+        // The optional job must not fail the workflow...
+        assert!(
+            result.is_ok(),
+            "optional job should not fail the workflow: {:?}",
+            result.err()
+        );
+        assert_eq!(executed.load(Ordering::SeqCst), 0, "job must not execute");
+
+        // ...but it must reach a terminal, non-Pending state in the tracker.
+        let (status, message) = tracker
+            .final_status("take_screenshot")
+            .expect("prerequisite failure must be persisted, not left Pending");
+        assert_eq!(status, JobStatus::Failure);
+
+        let message = message.expect("failure must carry a reason");
+        assert!(
+            message.contains("Failed to launch Chrome browser"),
+            "reason must reach the user, got: {}",
+            message
+        );
+    }
+
+    /// A required job that fails prerequisites still fails the workflow, but must
+    /// also leave a Failure row behind rather than a Pending one.
+    #[tokio::test]
+    async fn test_required_job_failing_prerequisites_is_persisted_before_erroring() {
+        let job = Arc::new(NonRunningJob {
+            id: "deploy".to_string(),
+            skip: false,
+            prerequisite_error: Some("docker daemon unreachable".to_string()),
+            executed: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let (tracker, result) = run_with_tracker(job, true, false).await;
+
+        assert!(matches!(result, Err(WorkflowError::JobValidationFailed(_))));
+
+        let (status, message) = tracker
+            .final_status("deploy")
+            .expect("prerequisite failure must be persisted, not left Pending");
+        assert_eq!(status, JobStatus::Failure);
+        assert!(message
+            .unwrap_or_default()
+            .contains("docker daemon unreachable"));
+    }
+
+    /// A job that opts out via `should_skip` must be persisted as Skipped.
+    #[tokio::test]
+    async fn test_skipped_job_is_persisted_as_skipped() {
+        let executed = Arc::new(AtomicUsize::new(0));
+        let job = Arc::new(NonRunningJob {
+            id: "configure_crons".to_string(),
+            skip: true,
+            prerequisite_error: None,
+            executed: executed.clone(),
+        });
+
+        let (tracker, result) = run_with_tracker(job, false, true).await;
+
+        assert!(result.is_ok());
+        assert_eq!(executed.load(Ordering::SeqCst), 0, "job must not execute");
+
+        let (status, _) = tracker
+            .final_status("configure_crons")
+            .expect("skipped job must be persisted, not left Pending");
+        assert_eq!(status, JobStatus::Skipped);
     }
 }
