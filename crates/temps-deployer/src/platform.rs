@@ -90,6 +90,32 @@ pub fn platforms_match(a: &str, b: &str) -> bool {
     normalized_platform_key(a) == normalized_platform_key(b)
 }
 
+/// Architectures Temps will hand to `docker build --platform`.
+///
+/// Deliberately an allowlist. A node reports its architecture over the
+/// network, and that value ends up as a build target for every deployment
+/// eligible for that node — so an unrecognised value must not reach Docker,
+/// where it fails the build for everyone. Contains the platforms Docker
+/// publishes official images for.
+const BUILDABLE_ARCHES: &[&str] = &[
+    "amd64", "arm64", "arm/v7", "arm/v6", "386", "ppc64le", "s390x", "riscv64", "mips64le",
+];
+
+/// Whether we can ask a Docker daemon to build for this platform.
+///
+/// Unknown architectures are still *stored* and compared verbatim — a node
+/// running something exotic simply never matches an image, which is the safe
+/// outcome. This gate only decides whether we'd attempt a build for it.
+pub fn is_buildable_platform(platform: &str) -> bool {
+    let canonical = canonicalize_platform(platform);
+    let Some((os, arch)) = canonical.split_once('/') else {
+        return false;
+    };
+    // Docker builds Linux images; a `windows/amd64` node is not something this
+    // build path can serve.
+    os == "linux" && BUILDABLE_ARCHES.contains(&arch)
+}
+
 /// Canonical `os/arch` form of a single platform string.
 ///
 /// Accepts everything the ecosystem spells differently — `arm64`,
@@ -198,6 +224,24 @@ mod tests {
             tag_for_platform("myapp:latest", "linux/arm64", "linux/amd64"),
             "myapp:latest-arm64"
         );
+    }
+
+    #[test]
+    fn test_is_buildable_platform() {
+        assert!(is_buildable_platform("linux/amd64"));
+        assert!(is_buildable_platform("linux/arm64"));
+        // Equivalent spellings resolve the same way.
+        assert!(is_buildable_platform("linux/aarch64"));
+        assert!(is_buildable_platform("arm64"));
+        assert!(is_buildable_platform("linux/arm/v7"));
+
+        // A node reporting this must never turn into `docker build --platform
+        // linux/foo`, which would fail the build for every deployment eligible
+        // for that node.
+        assert!(!is_buildable_platform("linux/foo"));
+        assert!(!is_buildable_platform("linux/riscv128"));
+        assert!(!is_buildable_platform("windows/amd64"));
+        assert!(!is_buildable_platform(""));
     }
 
     #[test]

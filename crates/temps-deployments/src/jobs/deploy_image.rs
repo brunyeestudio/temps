@@ -120,6 +120,15 @@ pub struct DeploymentOutput {
     /// Node IDs for each replica (None = local node). Parallel to container_ids.
     #[serde(default)]
     pub node_ids: Vec<Option<i32>>,
+    /// Image tag each replica actually runs. Parallel to `container_ids`.
+    ///
+    /// On a mixed-architecture deployment these differ per replica
+    /// (`app:latest` on amd64 nodes, `app:latest-arm64` on arm64 ones), and
+    /// `MarkDeploymentCompleteJob` records them per container — otherwise every
+    /// row would claim the primary tag and the node/deployment APIs would
+    /// report ARM replicas as running the amd64 image.
+    #[serde(default)]
+    pub image_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1023,6 +1032,7 @@ impl DeployImageJob {
         let mut all_container_ids = Vec::new();
         let mut all_host_ports = Vec::new();
         let mut all_node_ids: Vec<Option<i32>> = Vec::new();
+        let mut all_image_names: Vec<String> = Vec::new();
         let mut resolved_container_port: Option<u16> = None;
         let mut deployment_error: Option<WorkflowError> = None;
 
@@ -1140,6 +1150,7 @@ impl DeployImageJob {
                     all_container_ids.push(container_id);
                     all_host_ports.push(host_port);
                     all_node_ids.push(assignment.node_id());
+                    all_image_names.push(replica_image_tag.clone());
                     // All replicas share the same container port
                     resolved_container_port = Some(container_port);
                 }
@@ -1197,6 +1208,7 @@ impl DeployImageJob {
             host_ports: all_host_ports,
             container_port: resolved_container_port.unwrap_or(self.config.port as u16),
             node_ids: all_node_ids,
+            image_names: all_image_names,
         })
     }
 
@@ -1985,6 +1997,10 @@ impl WorkflowTask for DeployImageJob {
         )?;
         context.set_output(&self.job_id, "host_ports", &deployment_output.host_ports)?;
         context.set_output(&self.job_id, "node_ids", &deployment_output.node_ids)?;
+        // Consumed by MarkDeploymentCompleteJob to record what each container
+        // actually runs; without it every replica of a mixed-architecture
+        // deployment is stored under the primary tag.
+        context.set_output(&self.job_id, "image_names", &deployment_output.image_names)?;
 
         // For backward compatibility, also set singular fields using the first container
         if !deployment_output.container_ids.is_empty() {
@@ -2499,6 +2515,52 @@ mod tests {
             }))
             .build(container_deployer)
             .unwrap()
+    }
+
+    /// Each replica's record must name the image that replica actually runs.
+    /// `MarkDeploymentCompleteJob` reads the `image_names` output when writing
+    /// `deployment_containers`; without it every row falls back to the
+    /// deployment's primary tag, so on a mixed fleet the node and deployment
+    /// APIs would report ARM replicas as running the amd64 image.
+    #[test]
+    fn test_deployment_output_carries_a_tag_per_replica() {
+        let output = DeploymentOutput {
+            status: DeploymentStatus::Running,
+            replicas: 2,
+            resources: ResourceUsage::default(),
+            container_ids: vec!["c1".to_string(), "c2".to_string()],
+            host_ports: vec![30001, 30002],
+            container_port: 3000,
+            node_ids: vec![None, Some(7)],
+            image_names: vec!["app:latest".to_string(), "app:latest-arm64".to_string()],
+        };
+
+        // Parallel to container_ids, which is how the consumer indexes them.
+        assert_eq!(output.image_names.len(), output.container_ids.len());
+        assert_eq!(output.image_names[1], "app:latest-arm64");
+
+        // And it survives the workflow context round-trip the job performs.
+        let encoded = serde_json::to_value(&output.image_names).unwrap();
+        let decoded: Vec<String> = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, output.image_names);
+    }
+
+    /// Older workflow contexts have no `image_names`; deserialization must not
+    /// break for a deployment that was in flight across an upgrade.
+    #[test]
+    fn test_deployment_output_without_image_names_still_parses() {
+        let legacy = serde_json::json!({
+            "status": "Running",
+            "replicas": 1,
+            "resources": {},
+            "container_ids": ["c1"],
+            "host_ports": [30001],
+            "container_port": 3000
+        });
+
+        let output: DeploymentOutput = serde_json::from_value(legacy).unwrap();
+        assert!(output.image_names.is_empty());
+        assert!(output.node_ids.is_empty());
     }
 
     /// The "scheduling failed, deploy locally" fallback is a degradation, not

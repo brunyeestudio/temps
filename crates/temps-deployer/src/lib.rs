@@ -28,8 +28,8 @@ pub mod remote;
 pub mod static_deployer;
 
 pub use platform::{
-    canonicalize_platform, native_platform, normalize_arch, normalize_platform, platform_arch,
-    platform_tag_suffix, platforms_match, tag_for_platform,
+    canonicalize_platform, is_buildable_platform, native_platform, normalize_arch,
+    normalize_platform, platform_arch, platform_tag_suffix, platforms_match, tag_for_platform,
 };
 
 #[derive(Error, Debug)]

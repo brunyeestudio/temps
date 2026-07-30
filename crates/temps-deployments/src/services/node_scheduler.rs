@@ -81,6 +81,16 @@ pub enum SchedulingStrategy {
 /// are excluded from scheduling unless all nodes exceed it.
 const DEFAULT_MAX_LOAD_THRESHOLD: f64 = 0.90;
 
+/// Most platforms a single deployment will be cross-built for, including the
+/// control plane's own.
+///
+/// Each one costs a full image build — emulated, and therefore slow — on the
+/// control plane, so this bounds the work one deploy can queue no matter how
+/// many distinct architectures the fleet reports. Four covers every realistic
+/// mixed fleet (amd64 + arm64, plus room to spare); beyond that, splitting the
+/// deployment per architecture with target nodes/labels is the right answer.
+const MAX_CROSS_BUILD_PLATFORMS: usize = 4;
+
 /// Schedules replicas across available nodes using resource-aware placement.
 ///
 /// Default strategy is `LeastLoaded`: each replica is assigned to the node
@@ -253,6 +263,23 @@ impl NodeScheduler {
             if temps_deployer::platform::platforms_match(node_platform, &local) {
                 continue;
             }
+            // The architecture arrives over the network from the node itself,
+            // and whatever lands here is handed to `docker build --platform`
+            // for EVERY deployment this node is eligible for. An unrecognised
+            // value would fail all of those builds, so a single buggy — or
+            // hostile — node must not be able to do that. Such a node simply
+            // never matches an image and is skipped by the placement filter,
+            // which is the safe outcome.
+            if !temps_deployer::platform::is_buildable_platform(node_platform) {
+                tracing::warn!(
+                    node_id = node.id,
+                    node_name = %node.name,
+                    reported_platform = %node_platform,
+                    "Ignoring node architecture for cross-builds: not a platform Docker can \
+                     build for. Deployments will not be scheduled onto this node."
+                );
+                continue;
+            }
             let canonical = temps_deployer::platform::canonicalize_platform(node_platform);
             if !platforms.contains(&canonical) {
                 platforms.push(canonical);
@@ -267,6 +294,23 @@ impl NodeScheduler {
         // for the machine that builds and stores them.
         platforms.sort();
         platforms.insert(0, local);
+
+        // Every extra platform is a full image build on the control plane,
+        // usually emulated. Cap the fan-out so a cluster reporting many
+        // architectures can't turn one deploy into an unbounded build queue,
+        // and say which ones were dropped rather than silently truncating.
+        if platforms.len() > MAX_CROSS_BUILD_PLATFORMS {
+            let dropped: Vec<String> = platforms.split_off(MAX_CROSS_BUILD_PLATFORMS);
+            tracing::warn!(
+                kept = ?platforms,
+                dropped = ?dropped,
+                max = MAX_CROSS_BUILD_PLATFORMS,
+                "Cluster reports more architectures than one deployment will cross-build for; \
+                 nodes running the dropped platforms will not be scheduled onto. Use target \
+                 nodes/labels to split these deployments per architecture."
+            );
+        }
+
         Ok(platforms)
     }
 
@@ -1117,6 +1161,80 @@ mod tests {
 
         // Local first: it keeps the unsuffixed tag.
         assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+    }
+
+    /// A node's reported architecture becomes a `docker build --platform`
+    /// argument for every deployment it is eligible for. One node reporting
+    /// something Docker can't build for must not fail all of those builds.
+    #[tokio::test]
+    async fn test_required_build_platforms_ignores_unbuildable_architectures() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "weird", "linux/foo"),
+                make_node_with_arch(2, "windows", "windows/amd64"),
+            ],
+            "linux/amd64",
+        );
+
+        assert!(
+            scheduler
+                .required_build_platforms(None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unbuildable platforms must not become build targets"
+        );
+    }
+
+    /// The buildable ones still get through when mixed with junk.
+    #[tokio::test]
+    async fn test_required_build_platforms_keeps_valid_platforms_alongside_junk() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "weird", "linux/foo"),
+                make_node_with_arch(2, "worker-arm", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+
+        assert_eq!(
+            scheduler
+                .required_build_platforms(None, None)
+                .await
+                .unwrap(),
+            vec!["linux/amd64", "linux/arm64"]
+        );
+    }
+
+    /// Each extra platform is a full emulated build on the control plane, so
+    /// one deployment's fan-out has to be bounded no matter how many distinct
+    /// architectures the fleet reports.
+    #[tokio::test]
+    async fn test_required_build_platforms_is_bounded() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "a", "linux/arm64"),
+                make_node_with_arch(2, "b", "linux/386"),
+                make_node_with_arch(3, "c", "linux/ppc64le"),
+                make_node_with_arch(4, "d", "linux/s390x"),
+                make_node_with_arch(5, "e", "linux/riscv64"),
+                make_node_with_arch(6, "f", "linux/arm/v7"),
+            ],
+            "linux/amd64",
+        );
+
+        let platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap();
+        assert!(
+            platforms.len() <= 4,
+            "cross-build fan-out must stay bounded, got {:?}",
+            platforms
+        );
+        // The control plane's own platform is never dropped: it owns the
+        // primary tag.
+        assert_eq!(platforms.first().unwrap(), "linux/amd64");
     }
 
     #[tokio::test]
