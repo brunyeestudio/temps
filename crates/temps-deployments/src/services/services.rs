@@ -1052,7 +1052,10 @@ impl DeploymentService {
         let project = project.ok_or_else(|| {
             DeploymentError::NotFound(format!("project {} not found", project_id))
         })?;
-        debug!("Project found: {:?}", project);
+        debug!(
+            "Project found id={} slug={} preset={}",
+            project.id, project.slug, project.preset
+        );
 
         debug!(
             "Before invoking pipeline service project_id: {}, environment_id: {}",
@@ -1178,8 +1181,10 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        let preset = temps_presets::get_preset_by_slug(project.preset.as_str())
-            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        let preset =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
+                .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
+                .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
 
         // --- Git projects: rebuild from source when the image isn't reusable ---
         //
@@ -1889,8 +1894,10 @@ impl DeploymentService {
             source_deployment_id, target_env.name, project_id, image_name
         );
 
-        let preset = temps_presets::get_preset_by_slug(project.preset.as_str())
-            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        let preset =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
+                .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
+                .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
 
         let now = chrono::Utc::now();
 

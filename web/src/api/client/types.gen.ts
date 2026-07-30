@@ -2318,6 +2318,20 @@ export type CommitListResponse = {
  */
 export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
+/**
+ * A port that should be exposed publicly through the proxy for a compose service.
+ */
+export type ComposePublicPort = {
+    /**
+     * Container port to expose (e.g. 8123)
+     */
+    port: number;
+    /**
+     * Compose service name (e.g. "web", "clickhouse")
+     */
+    service: string;
+};
+
 export type ConnectionListQuery = {
     direction?: string | null;
     page?: number | null;
@@ -5303,6 +5317,24 @@ export type DockerRegistrySettingsMasked = {
 };
 
 /**
+ * Configuration for Docker Compose deployments.
+ */
+export type DockerComposePresetConfig = {
+    /**
+     * User-provided docker-compose.override.yml content.
+     */
+    composeOverride?: string | null;
+    /**
+     * Path to the Compose file relative to the project directory.
+     */
+    composePath?: string | null;
+    /**
+     * Compose service ports that should be publicly routed.
+     */
+    publicPorts?: Array<ComposePublicPort>;
+};
+
+/**
  * Configuration for Dockerfile preset
  * Allows customizing the Dockerfile path and build context for Docker-based deployments
  */
@@ -5317,7 +5349,16 @@ export type DockerfilePresetConfig = {
      * If not specified, defaults to "Dockerfile" in the build context
      */
     dockerfilePath?: string | null;
+    variant?: null | DockerfileVariant;
 };
+
+/**
+ * Catalog variant persisted under the canonical Dockerfile preset.
+ *
+ * Existing rows predate this discriminator and therefore deserialize as
+ * [`DockerfileVariant::File`].
+ */
+export type DockerfileVariant = 'file' | 'custom';
 
 /**
  * What to do with a domain during migration
@@ -9921,12 +9962,28 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
 
 /**
  * Configuration for Nixpacks preset
- * Nixpacks auto-detects your application and uses nixpacks.toml for configuration
- * No additional parameters needed - configuration is expressed in nixpacks.toml file
+ * Nixpacks provider and inline build-plan configuration.
  */
 export type NixpacksPresetConfig = {
-    [key: string]: unknown;
+    /**
+     * Optional inline nixpacks.toml contents.
+     */
+    nixpacksConfig?: string | null;
+    /**
+     * Ordered Nixpacks providers. Empty means repository config or auto-detect;
+     * include `...` to combine auto-detection with explicit providers.
+     */
+    providers?: Array<NixpacksProvider>;
 };
+
+/**
+ * A Nixpacks build provider.
+ *
+ * `Auto` serializes as the native Nixpacks `...` marker, which includes the
+ * provider detected from the project alongside any explicitly listed
+ * providers.
+ */
+export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
 
 export type NodeContainerListResponse = {
     containers: Array<NodeContainerResponse>;
@@ -11500,7 +11557,7 @@ export type PostgresWalHealth = {
  * Union type for preset configurations
  * Use the appropriate configuration type based on your preset
  */
-export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
+export type PresetConfigSchema = DockerfilePresetConfig | DockerComposePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
 
 /**
  * Detected preset information
