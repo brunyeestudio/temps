@@ -4,7 +4,7 @@
 //! These schemas are used in the API and validated when creating/updating projects.
 
 use serde::{Deserialize, Serialize};
-use temps_entities::preset::{DockerfileVariant, NixpacksProvider};
+use temps_entities::preset::{ComposePublicPort, DockerfileVariant, NixpacksProvider};
 
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
@@ -31,6 +31,24 @@ pub struct DockerfilePresetConfig {
     #[cfg_attr(feature = "openapi", schema(example = "./api"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_context: Option<String>,
+}
+
+/// Configuration for Docker Compose deployments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct DockerComposePresetConfig {
+    /// Path to the Compose file relative to the project directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_path: Option<String>,
+
+    /// User-provided docker-compose.override.yml content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_override: Option<String>,
+
+    /// Compose service ports that should be publicly routed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_ports: Vec<ComposePublicPort>,
 }
 
 /// Configuration for Nixpacks preset
@@ -86,6 +104,8 @@ pub struct StaticPresetConfig {
 pub enum PresetConfigSchema {
     /// Configuration for Dockerfile preset
     Dockerfile(DockerfilePresetConfig),
+    /// Configuration for Docker Compose
+    DockerCompose(DockerComposePresetConfig),
     /// Configuration for Nixpacks provider selection and inline build plan
     Nixpacks(NixpacksPresetConfig),
     /// Configuration for static site presets (Vite, Next.js, etc.)
@@ -142,6 +162,24 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["installCommand"], "bun install");
         assert_eq!(json["buildCommand"], "bun run build");
+    }
+
+    #[test]
+    fn test_docker_compose_config_serialization() {
+        let config = DockerComposePresetConfig {
+            compose_path: Some("deploy/compose.yml".to_string()),
+            compose_override: None,
+            public_ports: vec![ComposePublicPort {
+                service: "web".to_string(),
+                port: 3000,
+                ..Default::default()
+            }],
+        };
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["composePath"], "deploy/compose.yml");
+        assert_eq!(json["publicPorts"][0]["service"], "web");
+        assert_eq!(json["publicPorts"][0]["port"], 3000);
     }
 
     #[test]
