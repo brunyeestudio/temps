@@ -782,6 +782,8 @@ impl BuildImageJob {
             .await?;
 
             if let Some(platform) = platform {
+                self.verify_built_platform(&build_result.image_name, platform, context)
+                    .await?;
                 image_tags_by_platform.insert(
                     temps_deployer::platform::canonicalize_platform(platform),
                     build_result.image_name.clone(),
@@ -808,6 +810,55 @@ impl BuildImageJob {
             dockerfile_path,
             image_tags_by_platform,
         })
+    }
+
+    /// Confirm the image the daemon produced is actually for the platform we
+    /// asked for.
+    ///
+    /// This is not paranoia: Docker's **legacy builder silently ignores**
+    /// `platform`. It accepts the parameter, reports success, and hands back
+    /// an image of the host's architecture — so a cross-build would produce
+    /// `myapp:latest-arm64` containing amd64 binaries. Without this check the
+    /// mislabelled image travels to the arm64 node and fails much later, with
+    /// an error pointing at the node instead of at the build.
+    ///
+    /// BuildKit honours the platform correctly, so the fix is to enable it.
+    ///
+    /// An `inspect_image` that fails is not treated as a mismatch — some
+    /// `ImageBuilder` implementations don't support inspection at all, and a
+    /// missing check must not block an otherwise fine build.
+    async fn verify_built_platform(
+        &self,
+        image_name: &str,
+        requested_platform: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let built_platform = match self.image_builder.inspect_image(image_name).await {
+            Ok(info) => info.platform,
+            Err(e) => {
+                tracing::debug!(
+                    image = %image_name,
+                    "Could not inspect the built image to verify its platform: {}",
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        if temps_deployer::platform::platforms_match(&built_platform, requested_platform) {
+            return Ok(());
+        }
+
+        let msg = format!(
+            "Build for {} produced a {} image ('{}'). The Docker daemon accepted the \
+             requested platform but ignored it — this is what the legacy builder does. \
+             Enable BuildKit on the control plane (Docker 23+ enables it by default; \
+             otherwise set DOCKER_BUILDKIT=1 or install docker-buildx) and redeploy. \
+             Deploying this image would fail on the target node with 'exec format error'.",
+            requested_platform, built_platform, image_name
+        );
+        self.log(context, format!("ERROR: {}", msg)).await?;
+        Err(WorkflowError::JobExecutionFailed(msg))
     }
 
     /// Turn a build failure into a message that says what to do about it.

@@ -1609,14 +1609,28 @@ impl ImageBuilder for DockerRuntime {
     }
 
     async fn remove_image(&self, image_name: &str) -> Result<(), BuilderError> {
-        // Remove image - ignore any errors for now since it returns a stream
-        let _stream = self.docker.remove_image(
+        // The returned future used to be bound to `_stream` and dropped
+        // without ever being awaited, so nothing was sent to the daemon and
+        // every caller got a silent `Ok(())` while the image stayed put.
+        let deleted = self
+            .docker
+            .remove_image(
+                image_name,
+                Some(bollard::query_parameters::RemoveImageOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                BuilderError::Other(format!("Failed to remove image '{}': {}", image_name, e))
+            })?;
+
+        debug!(
+            "Removed image '{}' ({} layer(s) affected)",
             image_name,
-            Some(bollard::query_parameters::RemoveImageOptions {
-                force: true,
-                ..Default::default()
-            }),
-            None,
+            deleted.len()
         );
 
         Ok(())
@@ -3170,6 +3184,58 @@ mod docker_tests {
             platform == "linux/amd64" || platform == "linux/arm64",
             "Platform should be either linux/amd64 or linux/arm64, got: {}",
             platform
+        );
+    }
+
+    /// `remove_image` used to build its request future and drop it, so it
+    /// removed nothing and still returned `Ok(())`. Tests that clean up after
+    /// themselves depended on a call that did nothing.
+    #[tokio::test]
+    async fn test_remove_image_actually_removes_and_reports_failures() {
+        let runtime = test_runtime();
+        if runtime.docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        // Removing something that isn't there must be an error, not a silent
+        // success — that silent success is exactly the bug.
+        let missing = format!("temps-remove-test-{}:latest", uuid::Uuid::new_v4());
+        assert!(
+            runtime.remove_image(&missing).await.is_err(),
+            "removing a non-existent image must fail"
+        );
+
+        // And a real image must be gone afterwards.
+        let Ok(info) = runtime.inspect_image("alpine:3.20").await else {
+            println!("alpine:3.20 not present locally, skipping the positive case");
+            return;
+        };
+        let tag = format!("temps-remove-test-{}:latest", uuid::Uuid::new_v4());
+        if runtime
+            .docker
+            .tag_image(
+                &info.id,
+                Some(bollard::query_parameters::TagImageOptions {
+                    repo: tag.split(':').next().map(|r| r.to_string()),
+                    tag: Some("latest".to_string()),
+                }),
+            )
+            .await
+            .is_err()
+        {
+            println!("Could not tag a test image, skipping the positive case");
+            return;
+        }
+
+        assert!(runtime.inspect_image(&tag).await.is_ok());
+        runtime
+            .remove_image(&tag)
+            .await
+            .expect("remove should work");
+        assert!(
+            runtime.inspect_image(&tag).await.is_err(),
+            "the tag must be gone after remove_image"
         );
     }
 

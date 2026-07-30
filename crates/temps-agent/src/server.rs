@@ -582,3 +582,63 @@ async fn serve_mtls(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With no Docker client we can't know the daemon's architecture, so the
+    /// agent reports the one it was compiled for. That value must still be a
+    /// real platform string — the control plane stores it and schedules on it.
+    #[tokio::test]
+    async fn test_detect_agent_platform_falls_back_without_docker() {
+        let platform = detect_agent_platform(None).await;
+        assert_eq!(platform, temps_deployer::platform::native_platform());
+        assert!(
+            platform == "linux/amd64" || platform == "linux/arm64",
+            "unexpected fallback platform: {}",
+            platform
+        );
+    }
+
+    /// The reported platform must come from the **daemon**, not from this
+    /// process: an agent can drive a daemon over `DOCKER_HOST` (or an emulated
+    /// one) whose architecture differs from the binary's, and it is the daemon
+    /// that decides whether an image can run.
+    #[tokio::test]
+    async fn test_detect_agent_platform_reads_the_daemon() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        let reported = detect_agent_platform(Some(&docker)).await;
+
+        let info = docker.info().await.expect("docker info");
+        let expected = temps_deployer::platform::normalize_platform(
+            &info.os_type.unwrap_or_else(|| "linux".to_string()),
+            &info.architecture.expect("daemon architecture"),
+        );
+
+        assert_eq!(
+            reported, expected,
+            "the agent must report the daemon's platform"
+        );
+    }
+
+    /// Whatever the agent reports has to survive the canonicalization the
+    /// control plane applies before storing it — otherwise a node would be
+    /// recorded with a spelling that never matches an image platform.
+    #[tokio::test]
+    async fn test_reported_platform_is_already_canonical() {
+        let platform = detect_agent_platform(None).await;
+        assert_eq!(
+            platform,
+            temps_deployer::platform::canonicalize_platform(&platform)
+        );
+    }
+}
