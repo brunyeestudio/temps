@@ -467,6 +467,51 @@ impl DeployImageJob {
         }
     }
 
+    /// Guard the "just deploy it locally" fallbacks.
+    ///
+    /// Those paths exist so a scheduling hiccup degrades instead of failing —
+    /// which is right as long as the control plane can run the image. It can't
+    /// always: an uploaded image is now accepted when *any* node in the cluster
+    /// matches its architecture, so a remote-only image reaching this fallback
+    /// would be started on an incompatible control plane and die with
+    /// `exec format error`.
+    ///
+    /// Unknown platforms (`image_platforms` empty, or no image builder to ask)
+    /// keep the historical behaviour: proceed.
+    async fn ensure_local_can_run(
+        &self,
+        image_platforms: &[String],
+        context: &WorkflowContext,
+        reason: &str,
+    ) -> Result<(), WorkflowError> {
+        if image_platforms.is_empty() {
+            return Ok(());
+        }
+        let Some(image_builder) = self.image_builder.as_ref() else {
+            return Ok(());
+        };
+
+        let local_platform = image_builder.get_native_platform();
+        if image_platforms
+            .iter()
+            .any(|p| temps_deployer::platform::platforms_match(p, &local_platform))
+        {
+            return Ok(());
+        }
+
+        let msg = format!(
+            "Cannot deploy locally after falling back ({}): this image is built for [{}] \
+             and the control plane runs {}. It would fail to start with 'exec format error'. \
+             Retry once the worker nodes for [{}] are reachable.",
+            reason,
+            image_platforms.join(", "),
+            local_platform,
+            image_platforms.join(", ")
+        );
+        self.log(context, format!("ERROR: {}", msg)).await?;
+        Err(WorkflowError::JobExecutionFailed(msg))
+    }
+
     /// Verify that `image_tag` can actually run on the target node.
     ///
     /// Compares the image's architecture (read from the control plane's own
@@ -944,7 +989,16 @@ impl DeployImageJob {
                     self.log(context, format!("ERROR: {}", msg)).await?;
                     return Err(WorkflowError::JobExecutionFailed(msg));
                 }
+                // Any other scheduling error (a transient database failure,
+                // say) historically degrades to a local deployment. That is
+                // still the right call — but only when the control plane can
+                // actually run this image. An uploaded image accepted because
+                // some worker matches it would otherwise be started here and
+                // die with the very `exec format error` this feature exists to
+                // prevent.
                 Err(e) => {
+                    self.ensure_local_can_run(&image_platforms, context, &e.to_string())
+                        .await?;
                     self.log(
                         context,
                         format!(
@@ -957,7 +1011,11 @@ impl DeployImageJob {
                 }
             }
         } else {
-            // No scheduler injected — pure single-node mode
+            // No scheduler injected — pure single-node mode. Same guard: an
+            // image built for another architecture cannot run here either.
+            let image_platforms = self.available_image_platforms(image_output).await;
+            self.ensure_local_can_run(&image_platforms, context, "no node scheduler is configured")
+                .await?;
             vec![crate::services::NodeAssignment::Local; self.config.replicas as usize]
         };
 
@@ -2353,6 +2411,150 @@ mod tests {
             output.tag_for_platform(Some("linux/riscv64")),
             "myapp:latest"
         );
+    }
+
+    /// Minimal `ImageBuilder` that only answers "what platform do I run".
+    struct PlatformOnlyImageBuilder {
+        platform: String,
+    }
+
+    #[async_trait]
+    impl temps_deployer::ImageBuilder for PlatformOnlyImageBuilder {
+        async fn build_image(
+            &self,
+            _request: temps_deployer::BuildRequest,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn build_image_with_callback(
+            &self,
+            _request: temps_deployer::BuildRequestWithCallback,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn import_image(
+            &self,
+            _image_path: PathBuf,
+            _tag: &str,
+        ) -> Result<String, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &std::path::Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &std::path::Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn list_images(&self) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn remove_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn inspect_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        fn get_native_platform(&self) -> String {
+            self.platform.clone()
+        }
+    }
+
+    fn job_with_local_platform(platform: &str) -> DeployImageJob {
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        DeployImageJobBuilder::new()
+            .job_id("deploy".to_string())
+            .build_job_id("build".to_string())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".to_string(),
+                network: None,
+            })
+            .service_name("app".to_string())
+            .namespace("default".to_string())
+            .image_builder(Arc::new(PlatformOnlyImageBuilder {
+                platform: platform.to_string(),
+            }))
+            .build(container_deployer)
+            .unwrap()
+    }
+
+    /// The "scheduling failed, deploy locally" fallback is a degradation, not
+    /// a licence to run an image the control plane cannot execute. An uploaded
+    /// image is accepted when *any* node matches its architecture, so a
+    /// remote-only image can reach this path — and starting it here would
+    /// reproduce the `exec format error` this feature exists to prevent.
+    #[tokio::test]
+    async fn test_local_fallback_refuses_an_image_the_control_plane_cannot_run() {
+        let job = job_with_local_platform("linux/amd64");
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let err = job
+            .ensure_local_can_run(&["linux/arm64".to_string()], &context, "database timeout")
+            .await
+            .expect_err("an arm64-only image must not fall back onto an amd64 control plane");
+
+        let message = err.to_string();
+        assert!(message.contains("linux/arm64"), "got: {message}");
+        assert!(message.contains("linux/amd64"), "got: {message}");
+        // The operator needs to know why the fallback happened at all.
+        assert!(message.contains("database timeout"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn test_local_fallback_allowed_when_the_image_matches() {
+        let job = job_with_local_platform("linux/amd64");
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        // Same architecture, and the multi-arch case where one of the built
+        // platforms is the control plane's.
+        assert!(job
+            .ensure_local_can_run(&["linux/amd64".to_string()], &context, "whatever")
+            .await
+            .is_ok());
+        assert!(job
+            .ensure_local_can_run(
+                &["linux/arm64".to_string(), "linux/x86_64".to_string()],
+                &context,
+                "whatever"
+            )
+            .await
+            .is_ok());
+    }
+
+    /// Unknown platforms must not start blocking deployments that worked
+    /// before this feature existed.
+    #[tokio::test]
+    async fn test_local_fallback_allowed_when_platforms_are_unknown() {
+        let job = job_with_local_platform("linux/amd64");
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        assert!(job
+            .ensure_local_can_run(&[], &context, "whatever")
+            .await
+            .is_ok());
     }
 
     #[test]

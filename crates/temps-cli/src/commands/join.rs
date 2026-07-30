@@ -139,22 +139,26 @@ fn persist_tls(
 
 /// Detect the container platform this machine will run workloads on.
 ///
-/// Reads it from the local Docker daemon, which is the architecture that
-/// actually decides whether an image can run here — the CLI binary's own
-/// architecture is only a fallback for when Docker isn't reachable yet (the
-/// agent re-reports the real value on its first heartbeat).
-async fn detect_local_platform() -> String {
-    let fallback = temps_deployer::platform::native_platform();
-
+/// Reads it from the local Docker daemon: that is the architecture which
+/// decides whether an image can run here, and it differs from this binary's
+/// whenever `DOCKER_HOST` points at another machine or an emulated daemon.
+///
+/// Returns `None` when the daemon can't be reached. Reporting the CLI's own
+/// architecture instead would register a *confidently wrong* platform, and the
+/// control plane trusts what a node reports — it would schedule on that value
+/// and transfer an image the node cannot execute. An absent architecture is
+/// handled safely (the node is scheduled as unverified) and the agent fills it
+/// in on its first successful heartbeat.
+async fn detect_local_platform() -> Option<String> {
     let docker = match bollard::Docker::connect_with_defaults() {
         Ok(docker) => docker,
         Err(e) => {
             eprintln!(
-                "Warning: could not connect to Docker ({}); reporting {} from this binary. \
-                 The agent will correct this on its first heartbeat.",
-                e, fallback
+                "Warning: could not connect to Docker ({}). Registering without a container \
+                 platform; the agent reports it once the daemon is reachable.",
+                e
             );
-            return fallback;
+            return None;
         }
     };
 
@@ -162,17 +166,23 @@ async fn detect_local_platform() -> String {
         Ok(info) => {
             let os = info.os_type.unwrap_or_else(|| "linux".to_string());
             match info.architecture {
-                Some(arch) => temps_deployer::platform::normalize_platform(&os, &arch),
-                None => fallback,
+                Some(arch) => Some(temps_deployer::platform::normalize_platform(&os, &arch)),
+                None => {
+                    eprintln!(
+                        "Warning: the Docker daemon reported no architecture. Registering \
+                         without a container platform; the agent reports it later."
+                    );
+                    None
+                }
             }
         }
         Err(e) => {
             eprintln!(
-                "Warning: could not read Docker info ({}); reporting {} from this binary. \
-                 The agent will correct this on its first heartbeat.",
-                e, fallback
+                "Warning: could not read Docker info ({}). Registering without a container \
+                 platform; the agent reports it once the daemon is reachable.",
+                e
             );
-            fallback
+            None
         }
     }
 }
@@ -200,13 +210,17 @@ impl JoinCommand {
         // schedule correctly from the very first deploy, instead of waiting up
         // to 30s for the first heartbeat to reveal the architecture.
         let platform = detect_local_platform().await;
-        println!("Container platform: {}", platform);
+        match platform.as_deref() {
+            Some(platform) => println!("Container platform: {}", platform),
+            None => println!("Container platform: unknown (will be reported by the agent)"),
+        }
 
         if let Some(private_addr) = self.private_address.clone() {
-            self.join_direct(&node_name, &private_addr, &labels, &platform)
+            self.join_direct(&node_name, &private_addr, &labels, platform.as_deref())
                 .await?;
         } else {
-            self.join_via_relay(&node_name, &labels, &platform).await?;
+            self.join_via_relay(&node_name, &labels, platform.as_deref())
+                .await?;
         }
 
         Ok(())
@@ -247,7 +261,7 @@ impl JoinCommand {
         node_name: &str,
         private_address: &str,
         labels: &serde_json::Value,
-        platform: &str,
+        platform: Option<&str>,
     ) -> anyhow::Result<()> {
         println!(
             "Using direct mode with private address: {}",
@@ -358,7 +372,7 @@ impl JoinCommand {
         &self,
         node_name: &str,
         labels: &serde_json::Value,
-        platform: &str,
+        platform: Option<&str>,
     ) -> anyhow::Result<()> {
         println!("Using relay mode via {}...", self.relay_url);
 
@@ -581,4 +595,37 @@ async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
     }
 
     Some(format!("{}:{}", public_ip, wg_port))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The registration body must omit the architecture rather than assert
+    /// this binary's. The control plane trusts a reported platform: a wrong
+    /// one is scheduled on and gets an incompatible image transferred, whereas
+    /// an absent one is handled as unverified until the agent reports for real.
+    #[test]
+    fn test_registration_body_omits_an_unknown_platform() {
+        let with_platform = serde_json::json!({
+            "name": "worker-1",
+            "architecture": Some("linux/arm64"),
+        });
+        assert_eq!(with_platform["architecture"], "linux/arm64");
+
+        let unknown: Option<&str> = None;
+        let without_platform = serde_json::json!({
+            "name": "worker-1",
+            "architecture": unknown,
+        });
+        // `null` is what the control plane's `Option<String>` reads as "not
+        // reported", which leaves any stored value untouched.
+        assert!(
+            without_platform["architecture"].is_null(),
+            "unknown platform must not be sent as a value: {without_platform}"
+        );
+        assert_ne!(
+            without_platform["architecture"],
+            serde_json::json!(temps_deployer::platform::native_platform()),
+            "the CLI binary's architecture must never stand in for the daemon's"
+        );
+    }
 }
