@@ -500,7 +500,20 @@ impl DeployImageJob {
             return Ok(());
         };
 
-        let local_platform = image_builder.get_native_platform();
+        // The *confirmed* daemon platform, asked for if it isn't known yet.
+        // `get_native_platform()` would answer with this process's
+        // architecture, and on a cross-architecture `DOCKER_HOST` approving a
+        // local fallback on that basis lets the container through — the local
+        // verification below deliberately stays quiet while the platform is
+        // unknown, so nothing else would catch it.
+        let Some(local_platform) = image_builder.ensure_platform_discovered().await else {
+            tracing::warn!(
+                image_platforms = ?image_platforms,
+                "Control-plane platform unknown; deploying locally without an \
+                 architecture check"
+            );
+            return Ok(());
+        };
         if image_platforms
             .iter()
             .any(|p| temps_deployer::platform::platforms_match(p, &local_platform))
@@ -1085,10 +1098,10 @@ impl DeployImageJob {
         // `NodeAssignment::Local` carries no platform of its own, so without
         // this a local replica always takes the primary tag — which is the
         // wrong image whenever the primary was built for another architecture.
-        let local_platform = self
-            .image_builder
-            .as_ref()
-            .and_then(|builder| builder.discovered_platform());
+        let local_platform = match self.image_builder.as_ref() {
+            Some(builder) => builder.ensure_platform_discovered().await,
+            None => None,
+        };
 
         for (replica_index, assignment) in node_assignments.iter().enumerate() {
             // The tag this replica deploys. Reassigned below for remote nodes
@@ -2503,6 +2516,9 @@ mod tests {
         discovered: Option<String>,
         /// Platform `inspect_image` reports for any tag.
         image_platform: Option<String>,
+        /// What a discovery attempt would return. `None` models a daemon that
+        /// still doesn't answer.
+        discoverable: Option<String>,
     }
 
     impl PlatformOnlyImageBuilder {
@@ -2511,6 +2527,19 @@ mod tests {
                 platform: platform.to_string(),
                 discovered: Some(platform.to_string()),
                 image_platform: Some(image_platform.to_string()),
+                discoverable: None,
+            }
+        }
+
+        /// A daemon whose platform isn't cached yet but answers when asked —
+        /// the state an upload/external-image deploy starts in, since nothing
+        /// on that path runs a build.
+        fn discoverable_on_demand(fallback: &str, daemon: &str, image_platform: &str) -> Self {
+            Self {
+                platform: fallback.to_string(),
+                discovered: None,
+                image_platform: Some(image_platform.to_string()),
+                discoverable: Some(daemon.to_string()),
             }
         }
     }
@@ -2595,6 +2624,12 @@ mod tests {
         fn discovered_platform(&self) -> Option<String> {
             self.discovered.clone()
         }
+
+        async fn ensure_platform_discovered(&self) -> Option<String> {
+            self.discovered
+                .clone()
+                .or_else(|| self.discoverable.clone())
+        }
     }
 
     fn job_with_image_builder(builder: PlatformOnlyImageBuilder) -> DeployImageJob {
@@ -2619,6 +2654,7 @@ mod tests {
             platform: platform.to_string(),
             discovered: Some(platform.to_string()),
             image_platform: None,
+            discoverable: None,
         })
     }
 
@@ -2714,6 +2750,7 @@ mod tests {
             platform: "linux/amd64".to_string(),
             discovered: None,
             image_platform: Some("linux/arm64".to_string()),
+            discoverable: None,
         });
         let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
 
@@ -2764,6 +2801,32 @@ mod tests {
             )
             .await
             .is_ok());
+    }
+
+    /// An upload or external-image deploy never runs a build, so the daemon's
+    /// platform may still be undiscovered when the local fallback is
+    /// considered. Judging that on the binary's architecture would approve the
+    /// fallback — and the local verification stays quiet while the platform is
+    /// unknown, so the container would reach `exec format error` unchallenged.
+    /// Discovery has to happen here.
+    #[tokio::test]
+    async fn test_local_fallback_discovers_the_platform_before_authorising() {
+        // Binary says amd64; the daemon behind DOCKER_HOST is arm64 and will
+        // say so when asked. The image is amd64-only.
+        let job = job_with_image_builder(PlatformOnlyImageBuilder::discoverable_on_demand(
+            "linux/amd64",
+            "linux/arm64",
+            "linux/amd64",
+        ));
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let err = job
+            .ensure_local_can_run(&["linux/amd64".to_string()], &context, "database timeout")
+            .await
+            .expect_err("the daemon is arm64, so an amd64-only image cannot run here");
+
+        let message = err.to_string();
+        assert!(message.contains("linux/arm64"), "got: {message}");
     }
 
     /// Unknown platforms must not start blocking deployments that worked

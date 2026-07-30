@@ -578,6 +578,18 @@ pub trait ImageBuilder: Send + Sync {
         None
     }
 
+    /// Confirm the daemon's platform, querying it if that hasn't happened yet.
+    ///
+    /// [`Self::discovered_platform`] only reports what is already known, which
+    /// leaves callers on paths that never build — image uploads, external
+    /// images — permanently unable to tell a matching image from a mismatched
+    /// one. This lets them ask, at the cost of one `docker info`.
+    ///
+    /// Still `None` when the daemon can't be reached: unknown, never a guess.
+    async fn ensure_platform_discovered(&self) -> Option<String> {
+        self.discovered_platform()
+    }
+
     /// Validate that an image's architecture matches the target platform
     /// Returns Ok(()) if compatible, or Err(BuilderError::PlatformMismatch) if not
     async fn validate_image_platform(&self, image_name: &str) -> Result<(), BuilderError> {

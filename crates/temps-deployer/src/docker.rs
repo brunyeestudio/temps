@@ -1692,6 +1692,10 @@ impl ImageBuilder for DockerRuntime {
     fn discovered_platform(&self) -> Option<String> {
         self.daemon_platform.get().cloned()
     }
+
+    async fn ensure_platform_discovered(&self) -> Option<String> {
+        self.refresh_daemon_platform().await
+    }
 }
 
 #[async_trait]
