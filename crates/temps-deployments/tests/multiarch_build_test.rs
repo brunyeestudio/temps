@@ -106,7 +106,10 @@ async fn test_cross_platform_build_produces_images_of_both_architectures() {
     // Ask for the daemon's own platform plus the other mainstream one, so the
     // test covers a genuine cross-architecture build wherever it runs (amd64
     // CI today, arm64 laptops just as well).
-    let native = runtime.refresh_daemon_platform().await;
+    let Some(native) = runtime.refresh_daemon_platform().await else {
+        println!("Daemon did not report a platform, skipping");
+        return;
+    };
     let foreign = if temps_deployer::platform::platforms_match(&native, "linux/amd64") {
         "linux/arm64"
     } else {
@@ -230,7 +233,10 @@ async fn test_single_platform_build_produces_only_the_primary_tag() {
 
     let result = job.execute(context_with_repo(temp_dir.path())).await;
 
-    let native = runtime.refresh_daemon_platform().await;
+    let Some(native) = runtime.refresh_daemon_platform().await else {
+        println!("Daemon did not report a platform, skipping");
+        return;
+    };
     let suffixed = format!(
         "{}-{}",
         tag,
@@ -307,7 +313,10 @@ async fn test_legacy_builder_platform_mismatch_is_caught() {
         }
     }
 
-    let native = runtime.refresh_daemon_platform().await;
+    let Some(native) = runtime.refresh_daemon_platform().await else {
+        println!("Daemon did not report a platform, skipping");
+        return;
+    };
     let foreign = if temps_deployer::platform::platforms_match(&native, "linux/amd64") {
         "linux/arm64"
     } else {

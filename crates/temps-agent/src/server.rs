@@ -16,6 +16,28 @@ use crate::service_handlers;
 use crate::AgentConfig;
 use temps_deployer::{ContainerDeployer, ImageBuilder};
 
+/// The node's container platform once discovered, shared between the HTTP
+/// handlers and the heartbeat loop.
+///
+/// `None` means "not discovered yet" — the heartbeat loop keeps retrying and
+/// fills it in. A plain `Mutex` is right here: it's read once per request and
+/// written at most once, so there is no contention to design around.
+pub type SharedPlatform = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Read the discovered platform, treating a poisoned lock as "unknown" rather
+/// than panicking a request handler.
+pub fn read_platform(platform: &SharedPlatform) -> Option<String> {
+    platform.lock().ok().and_then(|p| p.clone())
+}
+
+/// Record a discovered platform. A poisoned lock is ignored — the next
+/// heartbeat retries anyway.
+fn store_platform(platform: &SharedPlatform, value: String) {
+    if let Ok(mut slot) = platform.lock() {
+        *slot = Some(value);
+    }
+}
+
 /// Build the agent Axum router with authentication middleware.
 pub fn build_router(
     container_deployer: Arc<dyn ContainerDeployer>,
@@ -24,7 +46,7 @@ pub fn build_router(
     config: &AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
     overlay_peers: crate::network_sync::SharedPeers,
-    platform: String,
+    platform: SharedPlatform,
 ) -> Router {
     let state = Arc::new(AgentState {
         container_deployer,
@@ -137,7 +159,8 @@ const HEARTBEAT_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 fn spawn_heartbeat_loop(
     config: &AgentConfig,
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
-    platform: String,
+    platform: SharedPlatform,
+    docker: Option<bollard::Docker>,
 ) {
     let control_plane_url = config.control_plane_url.clone();
     let node_id = config.node_id;
@@ -173,15 +196,41 @@ fn spawn_heartbeat_loop(
             interval.tick().await;
 
             let capacity = collect_capacity_metrics();
-            // `architecture` goes out on EVERY beat, not just registration:
-            // it's how a node upgraded from a pre-multi-arch agent (which
-            // left the column NULL) becomes schedulable with confidence, and
-            // how a re-pointed DOCKER_HOST is picked up without re-joining.
+
+            // Platform discovery can fail at startup — the agent often boots
+            // alongside the Docker daemon — so retry here until it answers.
+            // Reporting the agent binary's architecture instead would be a
+            // confident wrong answer whenever the daemon differs, and the
+            // control plane would schedule on it.
+            let reported_platform = match read_platform(&platform) {
+                Some(known) => Some(known),
+                None => {
+                    let discovered = detect_agent_platform(docker.as_ref()).await;
+                    if let Some(ref discovered) = discovered {
+                        tracing::info!(
+                            node_id,
+                            platform = %discovered,
+                            "Container platform resolved on retry"
+                        );
+                        store_platform(&platform, discovered.clone());
+                    }
+                    discovered
+                }
+            };
+
             let mut body = serde_json::json!({
                 "capacity": capacity,
                 "labels": labels,
-                "architecture": platform,
             });
+            // `architecture` goes out on EVERY beat once known, not just at
+            // registration: it's how a node upgraded from a pre-multi-arch
+            // agent (which left the column NULL) becomes schedulable with
+            // confidence, and how a re-pointed DOCKER_HOST is picked up
+            // without re-joining. While unknown the field is omitted, and the
+            // control plane leaves the stored value untouched.
+            if let Some(platform) = reported_platform {
+                body["architecture"] = serde_json::json!(platform);
+            }
 
             // On the first heartbeat (agent startup/reconnect), include a full
             // container inventory so the control plane can reconcile stale state.
@@ -327,44 +376,37 @@ fn spawn_heartbeat_loop(
 /// QEMU-emulated `docker:dind`, whose architecture differs from the binary's.
 /// Placing an image is decided by the daemon, so that is what we report.
 ///
-/// Falls back to the compiled-in architecture when Docker is unreachable —
-/// a wrong-but-plausible value beats no value, since the control plane treats
-/// a missing platform as "unknown, assume compatible" and would schedule here
-/// anyway.
-pub async fn detect_agent_platform(docker: Option<&bollard::Docker>) -> String {
-    let fallback = temps_deployer::platform::native_platform();
-
+/// Returns `None` when the daemon can't be reached or doesn't report an
+/// architecture. That is deliberate: falling back to the agent binary's
+/// architecture would be a *confident wrong answer* whenever the two differ
+/// (`DOCKER_HOST`, an emulated daemon), and the control plane trusts a
+/// reported platform — it would schedule an incompatible image and both
+/// compatibility checks would pass against the bogus value. "Unknown" is
+/// handled safely upstream (assume compatible, log it as unverified), and the
+/// heartbeat loop keeps retrying until the daemon answers.
+pub async fn detect_agent_platform(docker: Option<&bollard::Docker>) -> Option<String> {
     let Some(docker) = docker else {
         tracing::warn!(
-            "No Docker client available; reporting this binary's platform ({}) to the control plane",
-            fallback
+            "No Docker client available; this node will not report a container platform \
+             and the control plane cannot verify image compatibility for it"
         );
-        return fallback;
+        return None;
     };
 
     match docker.info().await {
         Ok(info) => {
             let os = info.os_type.unwrap_or_else(|| "linux".to_string());
             match info.architecture {
-                Some(arch) => temps_deployer::platform::normalize_platform(&os, &arch),
+                Some(arch) => Some(temps_deployer::platform::normalize_platform(&os, &arch)),
                 None => {
-                    tracing::warn!(
-                        "Docker daemon reported no architecture; \
-                         reporting this binary's platform ({})",
-                        fallback
-                    );
-                    fallback
+                    tracing::warn!("Docker daemon reported no architecture; will retry");
+                    None
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(
-                "Could not read Docker daemon info ({}); \
-                 reporting this binary's platform ({})",
-                e,
-                fallback
-            );
-            fallback
+            tracing::warn!("Could not read Docker daemon info ({}); will retry", e);
+            None
         }
     }
 }
@@ -404,18 +446,29 @@ pub async fn start_agent_server(
     overlay_peers: crate::network_sync::SharedPeers,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 ) -> Result<(), crate::AgentError> {
-    // Resolve the daemon's platform once, before anything can report it.
-    let platform = detect_agent_platform(docker.as_ref()).await;
-    tracing::info!(
-        node = %config.node_name,
-        platform = %platform,
-        "Agent container platform detected"
-    );
+    // Resolve the daemon's platform up front when possible. A failure here is
+    // not fatal and not cached as a wrong answer: the heartbeat loop retries
+    // until the daemon responds.
+    let platform: SharedPlatform = Arc::new(std::sync::Mutex::new(
+        detect_agent_platform(docker.as_ref()).await,
+    ));
+    match read_platform(&platform) {
+        Some(known) => tracing::info!(
+            node = %config.node_name,
+            platform = %known,
+            "Agent container platform detected"
+        ),
+        None => tracing::warn!(
+            node = %config.node_name,
+            "Container platform not detected yet; will retry on each heartbeat. \
+             Until then the control plane cannot verify image compatibility for this node."
+        ),
+    }
 
     let router = build_router(
         container_deployer.clone(),
         image_builder,
-        docker,
+        docker.clone(),
         &config,
         overlay_bridge_address.clone(),
         overlay_peers.clone(),
@@ -423,7 +476,7 @@ pub async fn start_agent_server(
     );
 
     // Start heartbeat background loop (with deployer for container inventory on first beat)
-    spawn_heartbeat_loop(&config, container_deployer, platform);
+    spawn_heartbeat_loop(&config, container_deployer, platform, docker);
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
     // agent — when this node has no compute_cidr allocated (single-host
@@ -587,24 +640,19 @@ async fn serve_mtls(
 mod tests {
     use super::*;
 
-    /// With no Docker client we can't know the daemon's architecture, so the
-    /// agent reports the one it was compiled for. That value must still be a
-    /// real platform string — the control plane stores it and schedules on it.
+    /// With no Docker client we cannot know the daemon's architecture, and
+    /// guessing the agent binary's would be a confident wrong answer whenever
+    /// the two differ (`DOCKER_HOST`, an emulated daemon). The control plane
+    /// trusts a reported platform, so "unknown" must stay unknown.
     #[tokio::test]
-    async fn test_detect_agent_platform_falls_back_without_docker() {
-        let platform = detect_agent_platform(None).await;
-        assert_eq!(platform, temps_deployer::platform::native_platform());
-        assert!(
-            platform == "linux/amd64" || platform == "linux/arm64",
-            "unexpected fallback platform: {}",
-            platform
-        );
+    async fn test_detect_agent_platform_is_unknown_without_docker() {
+        assert_eq!(detect_agent_platform(None).await, None);
     }
 
-    /// The reported platform must come from the **daemon**, not from this
-    /// process: an agent can drive a daemon over `DOCKER_HOST` (or an emulated
-    /// one) whose architecture differs from the binary's, and it is the daemon
-    /// that decides whether an image can run.
+    /// The reported platform must come from the **daemon**: an agent can drive
+    /// a daemon over `DOCKER_HOST` (or an emulated one) whose architecture
+    /// differs from the binary's, and it is the daemon that decides whether an
+    /// image can run.
     #[tokio::test]
     async fn test_detect_agent_platform_reads_the_daemon() {
         let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
@@ -616,7 +664,9 @@ mod tests {
             return;
         }
 
-        let reported = detect_agent_platform(Some(&docker)).await;
+        let reported = detect_agent_platform(Some(&docker))
+            .await
+            .expect("a reachable daemon must report a platform");
 
         let info = docker.info().await.expect("docker info");
         let expected = temps_deployer::platform::normalize_platform(
@@ -628,17 +678,38 @@ mod tests {
             reported, expected,
             "the agent must report the daemon's platform"
         );
+        // Whatever we report has to survive the canonicalization the control
+        // plane applies before storing it, or the node would be recorded with
+        // a spelling that never matches an image platform.
+        assert_eq!(
+            reported,
+            temps_deployer::platform::canonicalize_platform(&reported)
+        );
     }
 
-    /// Whatever the agent reports has to survive the canonicalization the
-    /// control plane applies before storing it — otherwise a node would be
-    /// recorded with a spelling that never matches an image platform.
-    #[tokio::test]
-    async fn test_reported_platform_is_already_canonical() {
-        let platform = detect_agent_platform(None).await;
-        assert_eq!(
-            platform,
-            temps_deployer::platform::canonicalize_platform(&platform)
+    /// An undiscovered platform must not be reported as a fact. The heartbeat
+    /// omits the field entirely so the control plane leaves whatever it has
+    /// alone, instead of overwriting a known architecture with a guess.
+    #[test]
+    fn test_unknown_platform_is_omitted_from_the_heartbeat_body() {
+        let slot: SharedPlatform = Arc::new(std::sync::Mutex::new(None));
+        assert_eq!(read_platform(&slot), None);
+
+        let mut body = serde_json::json!({ "capacity": {}, "labels": {} });
+        if let Some(platform) = read_platform(&slot) {
+            body["architecture"] = serde_json::json!(platform);
+        }
+        assert!(
+            body.get("architecture").is_none(),
+            "an unknown platform must not be sent at all: {body}"
         );
+
+        // Once discovered it is reported, and stays reported.
+        store_platform(&slot, "linux/arm64".to_string());
+        assert_eq!(read_platform(&slot).as_deref(), Some("linux/arm64"));
+        if let Some(platform) = read_platform(&slot) {
+            body["architecture"] = serde_json::json!(platform);
+        }
+        assert_eq!(body["architecture"], serde_json::json!("linux/arm64"));
     }
 }

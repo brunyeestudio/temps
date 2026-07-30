@@ -452,16 +452,23 @@ impl DockerRuntime {
 
     /// Query the Docker daemon for its platform and cache it.
     ///
-    /// Called once during startup (control-plane deployer plugin, agent
-    /// server) so every later `get_native_platform()` — which the
-    /// `ImageBuilder` trait requires to be synchronous — answers with the
+    /// Called during startup (control-plane deployer plugin, agent server) and
+    /// again before each build, so every later `get_native_platform()` — which
+    /// the `ImageBuilder` trait requires to be synchronous — answers with the
     /// daemon's real architecture instead of the binary's.
     ///
-    /// Failures are non-fatal: we log and keep the compiled-in fallback, since
-    /// a transient `docker info` error must not stop the node from booting.
-    pub async fn refresh_daemon_platform(&self) -> String {
+    /// **Only a successful lookup is cached.** Caching a failure would freeze
+    /// the compiled-in fallback for the process lifetime: with a
+    /// cross-architecture `DOCKER_HOST`, one transient `docker info` error at
+    /// boot would make every later build and scheduling decision use the wrong
+    /// architecture even after the daemon recovered. Returning `None` instead
+    /// lets the next call retry.
+    ///
+    /// Failures are non-fatal — a daemon that isn't up yet must not stop the
+    /// process from booting.
+    pub async fn refresh_daemon_platform(&self) -> Option<String> {
         if let Some(cached) = self.daemon_platform.get() {
-            return cached.clone();
+            return Some(cached.clone());
         }
 
         let platform = match self.docker.info().await {
@@ -470,33 +477,24 @@ impl DockerRuntime {
                 match info.architecture {
                     Some(arch) => crate::platform::normalize_platform(&os, &arch),
                     None => {
-                        warn!(
-                            "Docker daemon reported no architecture; \
-                             falling back to this binary's platform ({})",
-                            crate::platform::native_platform()
-                        );
-                        crate::platform::native_platform()
+                        warn!("Docker daemon reported no architecture; will retry");
+                        return None;
                     }
                 }
             }
             Err(e) => {
                 warn!(
-                    "Could not read the Docker daemon platform ({}); \
-                     falling back to this binary's platform ({})",
-                    e,
-                    crate::platform::native_platform()
+                    "Could not read the Docker daemon platform ({}); will retry",
+                    e
                 );
-                crate::platform::native_platform()
+                return None;
             }
         };
 
-        // A concurrent caller may have won the race — its value is equally
-        // valid, so keep whichever landed first.
-        let _ = self.daemon_platform.set(platform.clone());
-        self.daemon_platform
-            .get()
-            .cloned()
-            .unwrap_or_else(crate::platform::native_platform)
+        // A concurrent caller may have won the race — its value came from the
+        // same daemon, so keep whichever landed first.
+        let _ = self.daemon_platform.set(platform);
+        self.daemon_platform.get().cloned()
     }
 
     /// Apply build concurrency + per-build resource caps. Called by the
@@ -869,8 +867,10 @@ impl DockerRuntime {
     /// Detect the native platform for Docker builds.
     ///
     /// Prefers the daemon platform learned by [`Self::refresh_daemon_platform`]
-    /// and falls back to this binary's architecture before that runs (or when
-    /// `docker info` failed).
+    /// and falls back to this binary's architecture until that succeeds. The
+    /// fallback is never cached, so a daemon that comes up late (or recovers)
+    /// is picked up by the next refresh — see the build paths, which refresh
+    /// before using this.
     fn detect_native_platform(&self) -> String {
         self.daemon_platform
             .get()
@@ -956,6 +956,12 @@ impl DockerRuntime {
 #[async_trait]
 impl ImageBuilder for DockerRuntime {
     async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
+        // Cheap when already known (a `OnceLock` read); one `docker info` when
+        // discovery failed earlier. Doing it here means a daemon that wasn't up
+        // at boot — or a `DOCKER_HOST` pointing at another architecture — is
+        // reflected in the platform this build defaults to.
+        let _ = self.refresh_daemon_platform().await;
+
         // BuildKit is automatically detected and enabled if supported by Docker daemon
         // The standard Docker build API will use BuildKit when available (Docker 18.09+)
         info!(
@@ -1145,6 +1151,9 @@ impl ImageBuilder for DockerRuntime {
         &self,
         request_with_callback: crate::BuildRequestWithCallback,
     ) -> Result<BuildResult, BuilderError> {
+        // See `build_image`: refresh before defaulting to a platform.
+        let _ = self.refresh_daemon_platform().await;
+
         let request = request_with_callback.request;
         let log_callback = request_with_callback.log_callback;
 
@@ -3187,6 +3196,33 @@ mod docker_tests {
         );
     }
 
+    /// A failed lookup must NOT be cached. It used to store the compiled-in
+    /// fallback in the `OnceLock`, so one transient `docker info` error at
+    /// boot froze the wrong architecture for the process lifetime — with a
+    /// cross-architecture `DOCKER_HOST`, every later build and scheduling
+    /// decision then used the binary's architecture even after the daemon
+    /// recovered, defeating the very checks this is here to feed.
+    #[tokio::test]
+    async fn test_failed_platform_lookup_is_not_cached() {
+        // Port 1 is reserved and refuses connections: a client that can never
+        // reach a daemon, which is what a boot-time failure looks like.
+        let unreachable =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("client construction makes no connection");
+        let runtime = DockerRuntime::new(Arc::new(unreachable), false, "test-network".to_string());
+
+        assert_eq!(runtime.refresh_daemon_platform().await, None);
+        // Still uncached, so a later call retries instead of returning a
+        // stale guess.
+        assert_eq!(runtime.refresh_daemon_platform().await, None);
+        // The synchronous accessor keeps answering with the binary's platform
+        // meanwhile — a fallback, not a recorded fact.
+        assert_eq!(
+            runtime.get_native_platform(),
+            crate::platform::native_platform()
+        );
+    }
+
     /// `remove_image` used to build its request future and drop it, so it
     /// removed nothing and still returned `Ok(())`. Tests that clean up after
     /// themselves depended on a call that did nothing.
@@ -3250,7 +3286,10 @@ mod docker_tests {
             return;
         }
 
-        let platform = runtime.refresh_daemon_platform().await;
+        let platform = runtime
+            .refresh_daemon_platform()
+            .await
+            .expect("a reachable daemon must report a platform");
         assert!(
             platform.starts_with("linux/"),
             "expected a linux platform, got: {}",
@@ -3259,7 +3298,10 @@ mod docker_tests {
         // Cached: the trait method now answers with the daemon's platform.
         assert_eq!(runtime.get_native_platform(), platform);
         // And it is stable across calls (OnceLock, no re-query).
-        assert_eq!(runtime.refresh_daemon_platform().await, platform);
+        assert_eq!(
+            runtime.refresh_daemon_platform().await.as_deref(),
+            Some(platform.as_str())
+        );
     }
 
     #[tokio::test]

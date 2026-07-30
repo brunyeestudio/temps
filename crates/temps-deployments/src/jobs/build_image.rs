@@ -753,7 +753,14 @@ impl BuildImageJob {
             {
                 Ok(result) => result,
                 Err(e) => {
-                    let message = Self::describe_build_failure(platform.as_deref(), &e);
+                    // The *daemon's* platform, not the binary's: with a
+                    // cross-architecture DOCKER_HOST those differ, and using
+                    // the binary's would either recommend QEMU for a
+                    // daemon-native build or omit that advice for a real
+                    // cross-build.
+                    let build_host_platform = self.image_builder.get_native_platform();
+                    let message =
+                        Self::describe_build_failure(platform.as_deref(), &build_host_platform, &e);
                     self.log(context, format!("ERROR: {}", message)).await?;
                     return Err(WorkflowError::JobExecutionFailed(message));
                 }
@@ -864,21 +871,26 @@ impl BuildImageJob {
     /// Turn a build failure into a message that says what to do about it.
     ///
     /// Cross-architecture builds go through the daemon's `platform` option,
-    /// which silently requires QEMU binfmt handlers on the host. Without them
-    /// the failure surfaces as `exec format error` from inside the build — a
-    /// message that reads like a broken Dockerfile and sends people looking in
-    /// the wrong place. When we asked for a non-native platform, say so and
-    /// give the one command that fixes it.
+    /// which silently requires QEMU binfmt handlers on the build host. Without
+    /// them the failure surfaces as `exec format error` from inside the build —
+    /// a message that reads like a broken Dockerfile and sends people looking
+    /// in the wrong place. When we asked for a platform the build host doesn't
+    /// run natively, say so and give the one command that fixes it.
+    ///
+    /// `build_host_platform` must be the **daemon's** platform (from
+    /// `ImageBuilder::get_native_platform`), not this process's: they differ
+    /// whenever `DOCKER_HOST` points at another machine, and the advice would
+    /// then be aimed at the wrong host.
     fn describe_build_failure(
         platform: Option<&str>,
+        build_host_platform: &str,
         error: &temps_deployer::BuilderError,
     ) -> String {
         let Some(platform) = platform else {
             return format!("Failed to build image: {}", error);
         };
 
-        let native = temps_deployer::platform::native_platform();
-        if temps_deployer::platform::platforms_match(platform, &native) {
+        if temps_deployer::platform::platforms_match(platform, build_host_platform) {
             return format!("Failed to build image for {}: {}", platform, error);
         }
 
@@ -895,10 +907,10 @@ impl BuildImageJob {
                  Install it with: docker run --privileged --rm tonistiigi/binfmt --install {}. \
                  Alternatively, restrict this environment to {} nodes via target nodes/labels.",
                 platform,
-                native,
+                build_host_platform,
                 error,
                 temps_deployer::platform::platform_arch(platform),
-                native
+                build_host_platform
             )
         } else {
             format!("Failed to build image for {}: {}", platform, error)
@@ -1524,33 +1536,72 @@ mod tests {
 
     #[test]
     fn test_describe_build_failure_mentions_emulation_only_for_cross_builds() {
-        let native = temps_deployer::platform::native_platform();
+        let host = "linux/amd64";
 
         // Native build: plain error, no misleading emulation advice.
         let native_msg = BuildImageJob::describe_build_failure(
-            Some(&native),
+            Some(host),
+            host,
             &BuilderError::BuildFailed("exec format error".into()),
         );
         assert!(!native_msg.contains("binfmt"), "got: {}", native_msg);
 
         // Cross build failing for an unrelated reason: no emulation advice
         // either — don't send people chasing the wrong fix.
-        let other = if native == "linux/amd64" {
-            "linux/arm64"
-        } else {
-            "linux/amd64"
-        };
         let unrelated = BuildImageJob::describe_build_failure(
-            Some(other),
+            Some("linux/arm64"),
+            host,
             &BuilderError::BuildFailed("npm ERR! missing script: build".into()),
         );
         assert!(!unrelated.contains("binfmt"), "got: {}", unrelated);
-        assert!(unrelated.contains(other), "got: {}", unrelated);
+        assert!(unrelated.contains("linux/arm64"), "got: {}", unrelated);
 
         // No platform requested at all (single-arch path).
-        let plain =
-            BuildImageJob::describe_build_failure(None, &BuilderError::BuildFailed("boom".into()));
+        let plain = BuildImageJob::describe_build_failure(
+            None,
+            host,
+            &BuilderError::BuildFailed("boom".into()),
+        );
         assert_eq!(plain, "Failed to build image: Build failed: boom");
+    }
+
+    /// The advice must be aimed at the machine that runs the build. With a
+    /// cross-architecture `DOCKER_HOST` the daemon's platform and this
+    /// process's differ, and using the latter would recommend QEMU for a build
+    /// the daemon runs natively — or stay silent about a genuine cross-build.
+    #[test]
+    fn test_describe_build_failure_judges_against_the_build_host_not_the_binary() {
+        let emulation_failure = BuilderError::BuildFailed("exec format error".into());
+
+        // Daemon is arm64 (via DOCKER_HOST); an arm64 build is native there,
+        // whatever architecture this process was compiled for.
+        let native_on_remote_daemon = BuildImageJob::describe_build_failure(
+            Some("linux/arm64"),
+            "linux/arm64",
+            &emulation_failure,
+        );
+        assert!(
+            !native_on_remote_daemon.contains("binfmt"),
+            "a daemon-native build must not be blamed on missing emulation: {}",
+            native_on_remote_daemon
+        );
+
+        // Same daemon, amd64 build: that IS a cross-build for it.
+        let cross_on_remote_daemon = BuildImageJob::describe_build_failure(
+            Some("linux/amd64"),
+            "linux/arm64",
+            &emulation_failure,
+        );
+        assert!(
+            cross_on_remote_daemon.contains("binfmt"),
+            "a real cross-build must carry the install command: {}",
+            cross_on_remote_daemon
+        );
+        assert!(
+            cross_on_remote_daemon.contains("--install amd64"),
+            "the command must name the architecture to install: {}",
+            cross_on_remote_daemon
+        );
     }
 
     #[test]

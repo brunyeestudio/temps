@@ -227,7 +227,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
             let node_scheduler = Arc::new(
                 crate::services::NodeScheduler::new(node_service)
-                    .with_local_platform(image_builder.get_native_platform()),
+                    .with_platform_source(image_builder.clone()),
             );
             workflow_execution_service.set_node_scheduler(node_scheduler);
 

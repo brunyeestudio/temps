@@ -101,10 +101,21 @@ pub struct NodeScheduler {
     /// Nodes with a load score at or above this value are excluded from the
     /// scheduling pool. Range 0.0–1.0. Defaults to 0.90 (90%).
     max_load_threshold: f64,
-    /// Container platform of the control plane itself (the `Local` slot).
-    /// `None` disables platform filtering for `Local`, preserving the old
-    /// behaviour for callers that don't wire it up.
+    /// Container platform of the control plane itself (the `Local` slot),
+    /// pinned to a fixed value. Tests use this; production wires
+    /// `platform_source` instead so the value can't go stale.
+    /// `None` (with no source) disables platform filtering for `Local`,
+    /// preserving the old behaviour for callers that don't wire it up.
     local_platform: Option<String>,
+    /// Live source for the control plane's platform.
+    ///
+    /// Read on every use rather than snapshotted at construction: the
+    /// `DockerRuntime` discovers the daemon's architecture asynchronously and
+    /// retries after a failure, so a value captured at startup can be the
+    /// binary's architecture forever — on a cross-architecture `DOCKER_HOST`
+    /// that is exactly the wrong answer, and it would drive both the
+    /// scheduling filter and the cross-build decision.
+    platform_source: Option<Arc<dyn temps_deployer::ImageBuilder>>,
 }
 
 impl NodeScheduler {
@@ -116,7 +127,31 @@ impl NodeScheduler {
             strategy: SchedulingStrategy::default(),
             max_load_threshold: DEFAULT_MAX_LOAD_THRESHOLD,
             local_platform: None,
+            platform_source: None,
         }
+    }
+
+    /// Resolve the control plane's platform from the live image builder, so a
+    /// platform discovered (or corrected) after startup is picked up.
+    pub fn with_platform_source(
+        mut self,
+        image_builder: Arc<dyn temps_deployer::ImageBuilder>,
+    ) -> Self {
+        self.platform_source = Some(image_builder);
+        self
+    }
+
+    /// The control plane's container platform, or `None` when it was never
+    /// wired up (platform filtering for `Local` is then disabled).
+    fn local_platform(&self) -> Option<String> {
+        if let Some(source) = self.platform_source.as_ref() {
+            let platform = source.get_native_platform();
+            let platform = platform.trim();
+            if !platform.is_empty() {
+                return Some(temps_deployer::platform::canonicalize_platform(platform));
+            }
+        }
+        self.local_platform.clone()
     }
 
     /// Declare the control plane's own container platform so the `Local` slot
@@ -157,10 +192,10 @@ impl NodeScheduler {
         if image_platforms.is_empty() {
             return true;
         }
-        match self.local_platform.as_deref() {
+        match self.local_platform() {
             Some(local) => image_platforms
                 .iter()
-                .any(|p| temps_deployer::platform::platforms_match(p, local)),
+                .any(|p| temps_deployer::platform::platforms_match(p, &local)),
             None => true,
         }
     }
@@ -186,7 +221,7 @@ impl NodeScheduler {
         labels: Option<&serde_json::Value>,
         target_node_ids: Option<&[i32]>,
     ) -> Result<Vec<String>, NodeError> {
-        let Some(local) = self.local_platform.clone() else {
+        let Some(local) = self.local_platform() else {
             return Ok(Vec::new());
         };
 
@@ -362,8 +397,7 @@ impl NodeScheduler {
                 return Err(NodeError::NoCompatibleNode {
                     image_platforms: image_platforms.join(", "),
                     local_platform: self
-                        .local_platform
-                        .clone()
+                        .local_platform()
                         .unwrap_or_else(|| "unknown".to_string()),
                 });
             }
@@ -930,6 +964,119 @@ mod tests {
             .find(|a| !a.is_local())
             .expect("one replica should be remote");
         assert_eq!(remote.platform(), Some("linux/arm64"));
+    }
+
+    /// The control plane's platform is discovered asynchronously and retried
+    /// after a failure, so the scheduler must read it live. Snapshotting it at
+    /// construction meant a boot-time discovery failure froze the binary's
+    /// architecture — the wrong answer on a cross-architecture `DOCKER_HOST` —
+    /// and it drove both the `Local` filter and the cross-build decision.
+    #[tokio::test]
+    async fn test_local_platform_follows_the_live_image_builder() {
+        use std::sync::Mutex;
+
+        /// Stands in for `DockerRuntime`, whose platform starts out unknown
+        /// (falling back to the binary's) and becomes the daemon's once
+        /// discovery succeeds.
+        struct LateDiscoveryBuilder {
+            platform: Mutex<String>,
+        }
+
+        #[async_trait::async_trait]
+        impl temps_deployer::ImageBuilder for LateDiscoveryBuilder {
+            async fn build_image(
+                &self,
+                _request: temps_deployer::BuildRequest,
+            ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn build_image_with_callback(
+                &self,
+                _request: temps_deployer::BuildRequestWithCallback,
+            ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn import_image(
+                &self,
+                _image_path: std::path::PathBuf,
+                _tag: &str,
+            ) -> Result<String, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn save_image(
+                &self,
+                _image_name: &str,
+                _output_path: &std::path::Path,
+            ) -> Result<(), temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn extract_from_image(
+                &self,
+                _image_name: &str,
+                _source_path: &str,
+                _destination_path: &std::path::Path,
+            ) -> Result<(), temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn list_images(&self) -> Result<Vec<String>, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn remove_image(
+                &self,
+                _image_name: &str,
+            ) -> Result<(), temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn inspect_image(
+                &self,
+                _image_name: &str,
+            ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            fn get_native_platform(&self) -> String {
+                self.platform.lock().unwrap().clone()
+            }
+        }
+
+        let builder = Arc::new(LateDiscoveryBuilder {
+            platform: Mutex::new("linux/amd64".to_string()),
+        });
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+                vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            ])
+            .into_connection();
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+            .with_platform_source(builder.clone());
+
+        // While the control plane looks amd64, an arm64 worker means a
+        // cross-build is needed.
+        assert_eq!(
+            scheduler
+                .required_build_platforms(None, None)
+                .await
+                .unwrap(),
+            vec!["linux/amd64", "linux/arm64"]
+        );
+
+        // Discovery corrects the platform: the daemon is arm64 after all, so
+        // the cluster is homogeneous and nothing needs cross-building.
+        *builder.platform.lock().unwrap() = "linux/arm64".to_string();
+        assert!(scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // ── required_build_platforms ─────────────────────────────────────────

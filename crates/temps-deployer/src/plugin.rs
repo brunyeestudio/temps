@@ -174,11 +174,19 @@ impl TempsPlugin for DeployerPlugin {
             // architecture, which is wrong whenever `DOCKER_HOST` points at a
             // daemon on another machine. The scheduler and the pre-transfer
             // platform check both depend on this value being the daemon's.
-            let daemon_platform = docker_runtime.refresh_daemon_platform().await;
-            tracing::info!(
-                platform = %daemon_platform,
-                "Control-plane container platform detected"
-            );
+            match docker_runtime.refresh_daemon_platform().await {
+                Some(platform) => tracing::info!(
+                    platform = %platform,
+                    "Control-plane container platform detected"
+                ),
+                // Not fatal, and deliberately not cached as the binary's
+                // architecture: each build retries the lookup, so a daemon
+                // that comes up late is picked up without a restart.
+                None => tracing::warn!(
+                    fallback = %crate::platform::native_platform(),
+                    "Could not detect the control-plane container platform;                      using this binary's architecture until the daemon answers"
+                ),
+            }
 
             // ADR-024: optionally start the control-plane DNS resolver so
             // containers deployed locally on the control plane — and every
