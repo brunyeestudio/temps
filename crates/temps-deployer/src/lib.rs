@@ -558,7 +558,25 @@ pub trait ImageBuilder: Send + Sync {
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
 
     /// Get the native platform string for this runtime (e.g., "linux/amd64" or "linux/arm64")
+    ///
+    /// May be a *fallback* — the architecture this binary was compiled for —
+    /// when the daemon's platform hasn't been discovered. Callers that must
+    /// not act on a guess should use [`Self::discovered_platform`] instead.
     fn get_native_platform(&self) -> String;
+
+    /// The platform this runtime **confirmed** with its Docker daemon, or
+    /// `None` when discovery hasn't succeeded.
+    ///
+    /// The distinction matters wherever a wrong answer is worse than no
+    /// answer: with a cross-architecture `DOCKER_HOST`, `get_native_platform`
+    /// reports this process's architecture until discovery lands, and treating
+    /// that as authoritative would pick the wrong image for the control plane.
+    ///
+    /// Defaults to `None` so an implementation that can't tell the difference
+    /// is treated as "unknown" rather than as a confirmation.
+    fn discovered_platform(&self) -> Option<String> {
+        None
+    }
 
     /// Validate that an image's architecture matches the target platform
     /// Returns Ok(()) if compatible, or Err(BuilderError::PlatformMismatch) if not

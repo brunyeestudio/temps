@@ -521,6 +521,51 @@ impl DeployImageJob {
         Err(WorkflowError::JobExecutionFailed(msg))
     }
 
+    /// Verify an image can run on the control plane before deploying it here.
+    ///
+    /// Only acts on a **confirmed** local platform: while the daemon's
+    /// architecture is unknown, comparing against the compiled-in fallback
+    /// could reject a perfectly good image, so we let the deploy proceed as it
+    /// did before multi-arch support.
+    async fn verify_image_platform_for_local(
+        &self,
+        image_tag: &str,
+        local_platform: Option<&str>,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let (Some(local_platform), Some(image_builder)) =
+            (local_platform, self.image_builder.as_ref())
+        else {
+            return Ok(());
+        };
+
+        let image_platform = match image_builder.inspect_image(image_tag).await {
+            Ok(info) => info.platform,
+            Err(e) => {
+                tracing::debug!(
+                    image = %image_tag,
+                    "Could not inspect image to verify it runs on the control plane: {}",
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        if temps_deployer::platform::platforms_match(&image_platform, local_platform) {
+            return Ok(());
+        }
+
+        let msg = format!(
+            "Image '{}' is built for {} but the control plane runs {}. \
+             The container would fail to start with 'exec format error'. \
+             Build for {} (multi-arch build), or restrict this environment to \
+             {} nodes with target nodes/labels.",
+            image_tag, image_platform, local_platform, local_platform, image_platform
+        );
+        self.log(context, format!("ERROR: {}", msg)).await?;
+        Err(WorkflowError::JobExecutionFailed(msg))
+    }
+
     /// Verify that `image_tag` can actually run on the target node.
     ///
     /// Compares the image's architecture (read from the control plane's own
@@ -1036,11 +1081,20 @@ impl DeployImageJob {
         let mut resolved_container_port: Option<u16> = None;
         let mut deployment_error: Option<WorkflowError> = None;
 
+        // The control plane's own platform, when its daemon confirmed one.
+        // `NodeAssignment::Local` carries no platform of its own, so without
+        // this a local replica always takes the primary tag — which is the
+        // wrong image whenever the primary was built for another architecture.
+        let local_platform = self
+            .image_builder
+            .as_ref()
+            .and_then(|builder| builder.discovered_platform());
+
         for (replica_index, assignment) in node_assignments.iter().enumerate() {
             // The tag this replica deploys. Reassigned below for remote nodes
             // whose architecture only becomes known after querying the agent.
             let mut replica_image_tag = image_output
-                .tag_for_platform(assignment.platform())
+                .tag_for_platform(assignment.platform().or(local_platform.as_deref()))
                 .to_string();
             self.log(
                 context,
@@ -1054,7 +1108,19 @@ impl DeployImageJob {
 
             // Select deployer based on node assignment
             let deployer: Arc<dyn ContainerDeployer> = match assignment {
-                crate::services::NodeAssignment::Local => self.container_deployer.clone(),
+                crate::services::NodeAssignment::Local => {
+                    // Remote replicas are checked before the image is
+                    // transferred; local ones had no equivalent guard, so a
+                    // mismatch here surfaced only as a container that won't
+                    // start.
+                    self.verify_image_platform_for_local(
+                        &replica_image_tag,
+                        local_platform.as_deref(),
+                        context,
+                    )
+                    .await?;
+                    self.container_deployer.clone()
+                }
                 crate::services::NodeAssignment::Remote {
                     address,
                     node_name,
@@ -2432,6 +2498,21 @@ mod tests {
     /// Minimal `ImageBuilder` that only answers "what platform do I run".
     struct PlatformOnlyImageBuilder {
         platform: String,
+        /// Platform the daemon confirmed, if any. `None` models a control
+        /// plane whose `docker info` hasn't answered yet.
+        discovered: Option<String>,
+        /// Platform `inspect_image` reports for any tag.
+        image_platform: Option<String>,
+    }
+
+    impl PlatformOnlyImageBuilder {
+        fn confirmed(platform: &str, image_platform: &str) -> Self {
+            Self {
+                platform: platform.to_string(),
+                discovered: Some(platform.to_string()),
+                image_platform: Some(image_platform.to_string()),
+            }
+        }
     }
 
     #[async_trait]
@@ -2488,17 +2569,35 @@ mod tests {
 
         async fn inspect_image(
             &self,
-            _image_name: &str,
+            image_name: &str,
         ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
-            unimplemented!("not used")
+            let Some(platform) = self.image_platform.clone() else {
+                return Err(temps_deployer::BuilderError::ImageNotFound(
+                    image_name.to_string(),
+                ));
+            };
+            Ok(temps_deployer::ImageInfo {
+                id: format!("sha256:{image_name}"),
+                architecture: temps_deployer::platform::platform_arch(&platform),
+                os: "linux".to_string(),
+                platform,
+                size_bytes: 1,
+                tags: vec![image_name.to_string()],
+                created: None,
+                working_dir: None,
+            })
         }
 
         fn get_native_platform(&self) -> String {
             self.platform.clone()
         }
+
+        fn discovered_platform(&self) -> Option<String> {
+            self.discovered.clone()
+        }
     }
 
-    fn job_with_local_platform(platform: &str) -> DeployImageJob {
+    fn job_with_image_builder(builder: PlatformOnlyImageBuilder) -> DeployImageJob {
         let container_deployer: Arc<dyn ContainerDeployer> =
             Arc::new(TrackingMockContainerDeployer::new());
         DeployImageJobBuilder::new()
@@ -2510,11 +2609,17 @@ mod tests {
             })
             .service_name("app".to_string())
             .namespace("default".to_string())
-            .image_builder(Arc::new(PlatformOnlyImageBuilder {
-                platform: platform.to_string(),
-            }))
+            .image_builder(Arc::new(builder))
             .build(container_deployer)
             .unwrap()
+    }
+
+    fn job_with_local_platform(platform: &str) -> DeployImageJob {
+        job_with_image_builder(PlatformOnlyImageBuilder {
+            platform: platform.to_string(),
+            discovered: Some(platform.to_string()),
+            image_platform: None,
+        })
     }
 
     /// Each replica's record must name the image that replica actually runs.
@@ -2561,6 +2666,61 @@ mod tests {
         let output: DeploymentOutput = serde_json::from_value(legacy).unwrap();
         assert!(output.image_names.is_empty());
         assert!(output.node_ids.is_empty());
+    }
+
+    /// Remote replicas are checked before the image is transferred; local ones
+    /// had no equivalent guard, so an image built for another architecture
+    /// reached the control plane's Docker and failed as a container that won't
+    /// start — with nothing in the log about architecture.
+    #[tokio::test]
+    async fn test_local_deploy_refuses_an_image_for_another_architecture() {
+        let job = job_with_image_builder(PlatformOnlyImageBuilder::confirmed(
+            "linux/amd64",
+            "linux/arm64",
+        ));
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let err = job
+            .verify_image_platform_for_local("app:latest-arm64", Some("linux/amd64"), &context)
+            .await
+            .expect_err("an arm64 image must not be deployed on an amd64 control plane");
+
+        let message = err.to_string();
+        assert!(message.contains("linux/arm64"), "got: {message}");
+        assert!(message.contains("linux/amd64"), "got: {message}");
+        assert!(message.contains("exec format error"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn test_local_deploy_accepts_a_matching_image() {
+        let job = job_with_image_builder(PlatformOnlyImageBuilder::confirmed(
+            "linux/amd64",
+            "linux/amd64",
+        ));
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        assert!(job
+            .verify_image_platform_for_local("app:latest", Some("linux/amd64"), &context)
+            .await
+            .is_ok());
+    }
+
+    /// While the control plane's own platform is unconfirmed, comparing
+    /// against the compiled-in fallback could reject a perfectly good image.
+    /// Unknown means "proceed", as it did before multi-arch support.
+    #[tokio::test]
+    async fn test_local_deploy_skips_the_check_when_the_platform_is_unknown() {
+        let job = job_with_image_builder(PlatformOnlyImageBuilder {
+            platform: "linux/amd64".to_string(),
+            discovered: None,
+            image_platform: Some("linux/arm64".to_string()),
+        });
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        assert!(job
+            .verify_image_platform_for_local("app:latest-arm64", None, &context)
+            .await
+            .is_ok());
     }
 
     /// The "scheduling failed, deploy locally" fallback is a degradation, not

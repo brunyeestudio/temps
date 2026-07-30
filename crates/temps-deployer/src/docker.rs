@@ -1688,6 +1688,10 @@ impl ImageBuilder for DockerRuntime {
     fn get_native_platform(&self) -> String {
         self.detect_native_platform()
     }
+
+    fn discovered_platform(&self) -> Option<String> {
+        self.daemon_platform.get().cloned()
+    }
 }
 
 #[async_trait]

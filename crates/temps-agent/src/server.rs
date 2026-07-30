@@ -148,6 +148,13 @@ const HEARTBEAT_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 /// Maximum backoff delay between heartbeat retries.
 const HEARTBEAT_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 
+/// Heartbeats between re-checks of an already-known container platform.
+///
+/// At the 30s heartbeat interval this is ~10 minutes. The daemon behind
+/// `DOCKER_HOST` can be repointed or replaced while the agent runs, and a node
+/// advertising a stale architecture gets images it cannot execute.
+const PLATFORM_RECHECK_BEATS: u32 = 20;
+
 /// Spawn a background task that sends heartbeats to the control plane every 30 seconds.
 ///
 /// On transient failures, retries up to `HEARTBEAT_MAX_RETRIES` times with exponential
@@ -191,6 +198,7 @@ fn spawn_heartbeat_loop(
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         let mut consecutive_failures: u32 = 0;
         let mut inventory_sent = false;
+        let mut beats_since_platform_check: u32 = 0;
 
         loop {
             interval.tick().await;
@@ -202,20 +210,46 @@ fn spawn_heartbeat_loop(
             // Reporting the agent binary's architecture instead would be a
             // confident wrong answer whenever the daemon differs, and the
             // control plane would schedule on it.
-            let reported_platform = match read_platform(&platform) {
-                Some(known) => Some(known),
-                None => {
-                    let discovered = detect_agent_platform(docker.as_ref()).await;
-                    if let Some(ref discovered) = discovered {
-                        tracing::info!(
-                            node_id,
-                            platform = %discovered,
-                            "Container platform resolved on retry"
-                        );
+            //
+            // A known platform is also re-checked periodically: `DOCKER_HOST`
+            // can be repointed, or the daemon replaced, under a running agent.
+            // Without this the node would keep advertising its old
+            // architecture indefinitely and receive images it can no longer
+            // run. One `docker info` every ~10 minutes is negligible next to
+            // that failure mode.
+            let known_platform = read_platform(&platform);
+            let due_for_recheck = beats_since_platform_check >= PLATFORM_RECHECK_BEATS;
+            let reported_platform = if known_platform.is_none() || due_for_recheck {
+                beats_since_platform_check = 0;
+                match detect_agent_platform(docker.as_ref()).await {
+                    Some(discovered) => {
+                        match known_platform.as_deref() {
+                            None => tracing::info!(
+                                node_id,
+                                platform = %discovered,
+                                "Container platform resolved on retry"
+                            ),
+                            Some(previous) if previous != discovered => tracing::warn!(
+                                node_id,
+                                previous,
+                                platform = %discovered,
+                                "Docker daemon architecture changed under a running agent; \
+                                 reporting the new platform"
+                            ),
+                            Some(_) => {}
+                        }
                         store_platform(&platform, discovered.clone());
+                        Some(discovered)
                     }
-                    discovered
+                    // The daemon stopped answering. Keep reporting the last
+                    // confirmed value rather than dropping to unknown: it was
+                    // true as of the last successful check, and a node whose
+                    // daemon is down fails its health checks anyway.
+                    None => known_platform,
                 }
+            } else {
+                beats_since_platform_check += 1;
+                known_platform
             };
 
             let mut body = serde_json::json!({
@@ -685,6 +719,50 @@ mod tests {
             reported,
             temps_deployer::platform::canonicalize_platform(&reported)
         );
+    }
+
+    /// A known platform is re-checked periodically. `DOCKER_HOST` can be
+    /// repointed, or the daemon replaced, under a running agent — a node that
+    /// keeps advertising its old architecture would be sent images it can no
+    /// longer execute.
+    #[test]
+    fn test_platform_recheck_cadence_is_bounded() {
+        // ~10 minutes at the 30s heartbeat interval: frequent enough that a
+        // swapped daemon is noticed, rare enough to be free.
+        assert_eq!(PLATFORM_RECHECK_BEATS, 20);
+
+        // Mirrors the loop's decision, which re-detects when the platform is
+        // unknown OR the counter is due.
+        let due = |beats: u32, known: bool| !known || beats >= PLATFORM_RECHECK_BEATS;
+
+        assert!(
+            due(0, false),
+            "unknown platform must be retried immediately"
+        );
+        assert!(
+            !due(1, true),
+            "a known platform is not re-checked every beat"
+        );
+        assert!(!due(PLATFORM_RECHECK_BEATS - 1, true));
+        assert!(due(PLATFORM_RECHECK_BEATS, true), "re-check must come due");
+    }
+
+    /// A daemon that stops answering must not drop the node back to "unknown":
+    /// the last confirmed value was true as of the last check, and a node whose
+    /// daemon is down fails its health checks anyway.
+    #[test]
+    fn test_a_failed_recheck_keeps_the_last_known_platform() {
+        let slot: SharedPlatform = Arc::new(std::sync::Mutex::new(Some("linux/arm64".to_string())));
+        let known = read_platform(&slot);
+
+        // What the loop does when re-detection returns None.
+        let reported = match None::<String> {
+            Some(discovered) => Some(discovered),
+            None => known,
+        };
+
+        assert_eq!(reported.as_deref(), Some("linux/arm64"));
+        assert_eq!(read_platform(&slot).as_deref(), Some("linux/arm64"));
     }
 
     /// An undiscovered platform must not be reported as a fact. The heartbeat

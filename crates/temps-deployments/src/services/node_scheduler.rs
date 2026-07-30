@@ -151,15 +151,26 @@ impl NodeScheduler {
         self
     }
 
-    /// The control plane's container platform, or `None` when it was never
-    /// wired up (platform filtering for `Local` is then disabled).
+    /// The control plane's container platform, or `None` when it isn't known.
+    ///
+    /// Reads the platform the builder **confirmed** with its daemon, never the
+    /// compiled-in fallback: with a cross-architecture `DOCKER_HOST` those
+    /// differ, and acting on the fallback would give the primary (unsuffixed)
+    /// tag to the wrong architecture — which the `Local` assignment then
+    /// deploys, since it carries no platform of its own.
+    ///
+    /// `None` disables platform filtering for `Local` and suppresses
+    /// cross-builds, which is the pre-multi-arch behaviour: degrade rather
+    /// than decide on a guess.
     fn local_platform(&self) -> Option<String> {
         if let Some(source) = self.platform_source.as_ref() {
-            let platform = source.get_native_platform();
-            let platform = platform.trim();
-            if !platform.is_empty() {
-                return Some(temps_deployer::platform::canonicalize_platform(platform));
+            if let Some(platform) = source.discovered_platform() {
+                let platform = platform.trim();
+                if !platform.is_empty() {
+                    return Some(temps_deployer::platform::canonicalize_platform(platform));
+                }
             }
+            return None;
         }
         self.local_platform.clone()
     }
@@ -1010,20 +1021,24 @@ mod tests {
         assert_eq!(remote.platform(), Some("linux/arm64"));
     }
 
-    /// The control plane's platform is discovered asynchronously and retried
-    /// after a failure, so the scheduler must read it live. Snapshotting it at
-    /// construction meant a boot-time discovery failure froze the binary's
-    /// architecture — the wrong answer on a cross-architecture `DOCKER_HOST` —
-    /// and it drove both the `Local` filter and the cross-build decision.
+    /// The control plane's platform must come from the daemon, read live and
+    /// only once confirmed. `get_native_platform` falls back to this process's
+    /// architecture, which differs from the daemon's on a cross-architecture
+    /// `DOCKER_HOST` — and that value decides both the `Local` filter and
+    /// which architecture owns the primary tag.
     #[tokio::test]
-    async fn test_local_platform_follows_the_live_image_builder() {
+    async fn test_local_platform_uses_only_a_confirmed_daemon_platform() {
         use std::sync::Mutex;
 
         /// Stands in for `DockerRuntime`, whose platform starts out unknown
         /// (falling back to the binary's) and becomes the daemon's once
         /// discovery succeeds.
         struct LateDiscoveryBuilder {
+            /// What `get_native_platform` answers — the compiled-in fallback
+            /// until the daemon is reached.
             platform: Mutex<String>,
+            /// What the daemon actually confirmed, if anything.
+            discovered: Mutex<Option<String>>,
         }
 
         #[async_trait::async_trait]
@@ -1088,14 +1103,22 @@ mod tests {
             fn get_native_platform(&self) -> String {
                 self.platform.lock().unwrap().clone()
             }
+
+            fn discovered_platform(&self) -> Option<String> {
+                self.discovered.lock().unwrap().clone()
+            }
         }
 
         let builder = Arc::new(LateDiscoveryBuilder {
+            // The binary is amd64; the daemon (via DOCKER_HOST) hasn't
+            // answered yet.
             platform: Mutex::new("linux/amd64".to_string()),
+            discovered: Mutex::new(None),
         });
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![
+                vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
                 vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
                 vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
             ])
@@ -1103,8 +1126,30 @@ mod tests {
         let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
             .with_platform_source(builder.clone());
 
-        // While the control plane looks amd64, an arm64 worker means a
-        // cross-build is needed.
+        // Undiscovered: no cross-build decided on a guess. Acting on the
+        // binary's amd64 would hand the primary (unsuffixed) tag to the wrong
+        // architecture, and `NodeAssignment::Local` — which carries no
+        // platform — would then deploy exactly that tag.
+        assert!(
+            scheduler
+                .required_build_platforms(None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unconfirmed platform must not drive cross-builds"
+        );
+
+        // The daemon answers, and it is arm64 like the worker: homogeneous
+        // cluster, nothing to cross-build.
+        *builder.discovered.lock().unwrap() = Some("linux/arm64".to_string());
+        assert!(scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Had it confirmed amd64, the arm64 worker would need its own image.
+        *builder.discovered.lock().unwrap() = Some("linux/amd64".to_string());
         assert_eq!(
             scheduler
                 .required_build_platforms(None, None)
@@ -1112,15 +1157,6 @@ mod tests {
                 .unwrap(),
             vec!["linux/amd64", "linux/arm64"]
         );
-
-        // Discovery corrects the platform: the daemon is arm64 after all, so
-        // the cluster is homogeneous and nothing needs cross-building.
-        *builder.platform.lock().unwrap() = "linux/arm64".to_string();
-        assert!(scheduler
-            .required_build_platforms(None, None)
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     // ── required_build_platforms ─────────────────────────────────────────
