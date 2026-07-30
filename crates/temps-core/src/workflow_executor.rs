@@ -130,28 +130,17 @@ impl WorkflowExecutor {
             {
                 warn!("🚫 Workflow {} was cancelled", config.workflow_run_id);
 
-                // Cancel all pending jobs via job tracker
-                if let Some(ref tracker) = self.job_tracker {
-                    warn!(
-                        "🧹 Cancelling all pending jobs in workflow {}",
-                        config.workflow_run_id
-                    );
-                    if let Err(e) = tracker
-                        .cancel_pending_jobs(
-                            &config.workflow_run_id,
-                            "Workflow cancelled by user".to_string(),
-                        )
-                        .await
-                    {
-                        error!("Failed to cancel pending jobs: {}", e);
-                    }
-                }
+                self.cancel_remaining_pending(
+                    &config.workflow_run_id,
+                    "Workflow cancelled by user".to_string(),
+                )
+                .await;
 
                 return Err(WorkflowError::WorkflowCancelled);
             }
 
             // Execute all jobs in this batch in parallel
-            let batch_results = self
+            let batch_results = match self
                 .execute_job_batch(
                     batch,
                     &mut job_states,
@@ -160,7 +149,22 @@ impl WorkflowExecutor {
                     cancellation_provider.clone(),
                     config.continue_on_failure,
                 )
-                .await?;
+                .await
+            {
+                Ok(results) => results,
+                Err(e) => {
+                    // Aborting mid-batch skips the per-result handling below, which is
+                    // what would normally cancel the rest of the workflow. Without this,
+                    // every job that never got to run keeps the planner's `Pending`
+                    // status forever and the UI polls it as still in progress.
+                    self.cancel_remaining_pending(
+                        &config.workflow_run_id,
+                        format!("Workflow aborted: {}", e),
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
 
             // Check if any required jobs failed
             for (job_id, result) in batch_results {
@@ -443,6 +447,27 @@ impl WorkflowExecutor {
         Ok(order)
     }
 
+    /// Move every still-`Pending` job in this workflow to `Cancelled`.
+    ///
+    /// Any path that leaves `execute_workflow` early must call this: jobs that
+    /// never ran keep the status the planner created them with, and a row left at
+    /// `Pending` reads as "still running" forever in the UI. Tracker failures are
+    /// logged and swallowed — cancellation bookkeeping must not mask the original
+    /// error that caused the abort.
+    async fn cancel_remaining_pending(&self, workflow_run_id: &str, reason: String) {
+        let Some(ref tracker) = self.job_tracker else {
+            return;
+        };
+
+        warn!(
+            "🧹 Cancelling all pending jobs in workflow {}",
+            workflow_run_id
+        );
+        if let Err(e) = tracker.cancel_pending_jobs(workflow_run_id, reason).await {
+            error!("Failed to cancel pending jobs: {}", e);
+        }
+    }
+
     /// Record a terminal status for a job that never entered execution.
     ///
     /// Jobs that are skipped or fail prerequisite validation never reach the
@@ -514,13 +539,13 @@ impl WorkflowExecutor {
                     // A job that never enters the batch results below must still reach a
                     // terminal state in the tracker, or its pre-created row stays Pending
                     // forever and the UI shows the step as still running.
-                    self.persist_terminal_status(
-                        context,
-                        &job_id,
-                        JobStatus::Skipped,
-                        Some("Job skipped: preconditions for running it were not met".to_string()),
-                    )
-                    .await;
+                    //
+                    // No message: `should_skip` is a deliberate opt-out (feature disabled,
+                    // nothing to do), not a failure, and the executor doesn't know the
+                    // job-specific reason — inventing one would put a fabricated string in
+                    // the `error_message` column for a job that never errored.
+                    self.persist_terminal_status(context, &job_id, JobStatus::Skipped, None)
+                        .await;
                     continue;
                 }
 
@@ -979,9 +1004,19 @@ mod tests {
     struct RecordingJobTracker {
         statuses: std::sync::Mutex<Vec<(String, JobStatus, Option<String>)>>,
         ids: std::sync::Mutex<HashMap<i32, String>>,
+        cancellations: std::sync::Mutex<Vec<String>>,
     }
 
     impl RecordingJobTracker {
+        /// Reasons passed to `cancel_pending_jobs` — i.e. the sweeps that would
+        /// move leftover Pending rows to Cancelled.
+        fn cancellations(&self) -> Vec<String> {
+            self.cancellations
+                .lock()
+                .expect("cancellations lock poisoned")
+                .clone()
+        }
+
         fn statuses_for(&self, job_id: &str) -> Vec<(JobStatus, Option<String>)> {
             self.statuses
                 .lock()
@@ -1062,8 +1097,12 @@ mod tests {
         async fn cancel_pending_jobs(
             &self,
             _workflow_run_id: &str,
-            _reason: String,
+            reason: String,
         ) -> Result<(), WorkflowError> {
+            self.cancellations
+                .lock()
+                .expect("cancellations lock poisoned")
+                .push(reason);
             Ok(())
         }
     }
@@ -1164,6 +1203,78 @@ mod tests {
             .contains("docker daemon unreachable"));
     }
 
+    /// Aborting out of a batch must sweep the jobs that never got to run.
+    ///
+    /// The early `return Err` on a required job's failed prerequisites bypasses the
+    /// per-result handling that normally cancels the rest of the workflow, so every
+    /// downstream job kept the planner's `Pending` status forever — the same stuck
+    /// state as #477, one branch over.
+    #[tokio::test]
+    async fn test_aborting_batch_cancels_jobs_that_never_ran() {
+        let downstream_executed = Arc::new(AtomicUsize::new(0));
+
+        let failing = Arc::new(NonRunningJob {
+            id: "deploy".to_string(),
+            skip: false,
+            prerequisite_error: Some("docker daemon unreachable".to_string()),
+            executed: Arc::new(AtomicUsize::new(0)),
+        });
+        let downstream = Arc::new(NonRunningJob {
+            id: "take_screenshot".to_string(),
+            skip: false,
+            prerequisite_error: None,
+            executed: downstream_executed.clone(),
+        });
+
+        let tracker = Arc::new(RecordingJobTracker::default());
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("test-workflow".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job_config(failing, vec![], true)
+            .with_job_config(downstream, vec!["deploy".to_string()], false)
+            .continue_on_failure(false)
+            .build()
+            .expect("workflow config should build");
+
+        let executor = WorkflowExecutor::new(Some(tracker.clone()));
+        let result = executor
+            .execute_workflow(
+                config,
+                Arc::new(TestCancellationProvider { cancelled: false }),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "required job failure must abort the workflow"
+        );
+        assert_eq!(
+            downstream_executed.load(Ordering::SeqCst),
+            0,
+            "downstream job must not run"
+        );
+
+        // take_screenshot never reached the executor, so only the sweep can move it
+        // off Pending.
+        assert!(
+            tracker.final_status("take_screenshot").is_none(),
+            "sanity: the downstream job should have no status of its own"
+        );
+        let cancellations = tracker.cancellations();
+        assert_eq!(
+            cancellations.len(),
+            1,
+            "aborting the workflow must cancel jobs left Pending, got: {:?}",
+            cancellations
+        );
+        assert!(
+            cancellations[0].contains("docker daemon unreachable"),
+            "cancellation reason should explain the abort, got: {}",
+            cancellations[0]
+        );
+    }
+
     /// A job that opts out via `should_skip` must be persisted as Skipped.
     #[tokio::test]
     async fn test_skipped_job_is_persisted_as_skipped() {
@@ -1180,9 +1291,15 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(executed.load(Ordering::SeqCst), 0, "job must not execute");
 
-        let (status, _) = tracker
+        let (status, message) = tracker
             .final_status("configure_crons")
             .expect("skipped job must be persisted, not left Pending");
         assert_eq!(status, JobStatus::Skipped);
+        assert!(
+            message.is_none(),
+            "an intentional skip is not an error and the executor doesn't know the \
+             job's reason — it must not fabricate one, got: {:?}",
+            message
+        );
     }
 }
