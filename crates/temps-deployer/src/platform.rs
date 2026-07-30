@@ -43,7 +43,13 @@ pub fn normalize_arch(arch: &str) -> String {
     match arch.trim().to_ascii_lowercase().as_str() {
         "x86_64" | "amd64" | "x86-64" => "amd64".to_string(),
         "aarch64" | "arm64" | "armv8" | "armv8l" => "arm64".to_string(),
+        // Docker reports ARM variants both as a suffixed name (`armv7l` from
+        // `docker info`) and as a bare `arm` plus a separate variant field.
+        // Bare `arm` means v7 in practice — it's what 32-bit ARM images
+        // default to — while v6 must keep its variant or it would be treated
+        // as v7 and rejected as unbuildable.
         "armv7l" | "armv7" | "arm" => "arm/v7".to_string(),
+        "armv6l" | "armv6" => "arm/v6".to_string(),
         "i386" | "i686" | "x86" => "386".to_string(),
         other => other.to_string(),
     }
@@ -158,6 +164,26 @@ mod tests {
         // case and whitespace insensitive
         assert_eq!(normalize_arch(" X86_64 "), "amd64");
         assert_eq!(normalize_arch("ARM64"), "arm64");
+    }
+
+    /// ARMv6 workers report `armv6l` from `docker info`. Without this mapping
+    /// the platform stays `linux/armv6l`, which isn't in the buildable set —
+    /// so no image is ever built for the node and the scheduler drops it,
+    /// despite `arm/v6` being advertised as supported.
+    #[test]
+    fn test_normalize_arch_arm_variants() {
+        assert_eq!(normalize_arch("armv6l"), "arm/v6");
+        assert_eq!(normalize_arch("armv6"), "arm/v6");
+        assert_eq!(normalize_arch("armv7l"), "arm/v7");
+        // Bare `arm` means v7, which is what 32-bit ARM images default to.
+        assert_eq!(normalize_arch("arm"), "arm/v7");
+        // Already-canonical variants survive untouched.
+        assert_eq!(normalize_arch("arm/v6"), "arm/v6");
+        assert_eq!(normalize_arch("arm/v7"), "arm/v7");
+
+        assert!(is_buildable_platform("linux/armv6l"));
+        assert!(!platforms_match("linux/armv6l", "linux/arm/v7"));
+        assert!(platforms_match("linux/armv6l", "linux/arm/v6"));
     }
 
     #[test]

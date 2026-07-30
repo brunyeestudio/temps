@@ -379,3 +379,89 @@ async fn test_legacy_builder_platform_mismatch_is_caught() {
         }
     }
 }
+
+/// ARMv6 is the one advertised platform where the variant matters end to end.
+///
+/// Docker reports an ARMv6 image as `architecture = "arm"` with
+/// `variant = "v6"`; a bare `arm` normalizes to v7, so dropping the variant
+/// makes a correctly built ARMv6 image look like the legacy builder mislabelled
+/// it — and the build fails. ARMv7 hides this bug, since `arm` and `arm/v7`
+/// happen to agree.
+#[tokio::test]
+async fn test_armv6_build_keeps_its_variant() {
+    use bollard::Docker;
+
+    let Ok(docker) = Docker::connect_with_local_defaults() else {
+        println!("Docker not available, skipping");
+        return;
+    };
+    let docker = Arc::new(docker);
+    if docker.ping().await.is_err() {
+        println!("Docker daemon not responding, skipping");
+        return;
+    }
+
+    let runtime = Arc::new(DockerRuntime::new(
+        docker.clone(),
+        true,
+        "temps-multiarch-test".to_string(),
+    ));
+    if let Err(e) = runtime.ensure_network_exists().await {
+        if !e.to_string().contains("already exists") {
+            println!("Could not create test network ({e}), skipping");
+            return;
+        }
+    }
+
+    let Some(native) = runtime.refresh_daemon_platform().await else {
+        println!("Daemon did not report a platform, skipping");
+        return;
+    };
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    write_fixture(temp_dir.path());
+
+    let tag = format!("temps-armv6-test-{}:latest", uuid::Uuid::new_v4());
+    let v6_tag = format!("{}-arm-v6", tag);
+
+    let image_builder: Arc<dyn ImageBuilder> = runtime.clone();
+    let job = BuildImageJobBuilder::new()
+        .job_id("build_armv6".to_string())
+        .download_job_id("download_repo".to_string())
+        .image_tag(tag.clone())
+        .dockerfile_path("Dockerfile".to_string())
+        .target_platforms(vec![native.clone(), "linux/arm/v6".to_string()])
+        .build(image_builder.clone())
+        .expect("build job");
+
+    let result = job.execute(context_with_repo(temp_dir.path())).await;
+
+    let v6_info = image_builder.inspect_image(&v6_tag).await;
+    let _ = image_builder.remove_image(&tag).await;
+    let _ = image_builder.remove_image(&v6_tag).await;
+
+    if let Err(e) = &result {
+        let error = e.to_string();
+        if error.contains("no matching manifest")
+            || error.contains("failed to resolve")
+            || error.contains("dial tcp")
+        {
+            println!("Could not pull the arm/v6 base image ({error}), skipping");
+            return;
+        }
+        panic!("armv6 build failed: {error}");
+    }
+
+    let v6_info = v6_info.expect("the arm/v6 tag should exist after the build");
+    assert!(
+        temps_deployer::platform::platforms_match(&v6_info.platform, "linux/arm/v6"),
+        "the built image must report arm/v6, got {}",
+        v6_info.platform
+    );
+    // The distinction that matters: v6 must not be mistaken for v7.
+    assert!(
+        !temps_deployer::platform::platforms_match(&v6_info.platform, "linux/arm/v7"),
+        "arm/v6 must not compare equal to arm/v7, got {}",
+        v6_info.platform
+    );
+}

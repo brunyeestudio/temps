@@ -1654,7 +1654,16 @@ impl ImageBuilder for DockerRuntime {
             .architecture
             .unwrap_or_else(|| "unknown".to_string());
         let os = inspect.os.unwrap_or_else(|| "linux".to_string());
-        let platform = format!("{}/{}", os, architecture);
+        // ARM images carry the variant in a separate field: an ARMv6 image is
+        // `architecture = "arm"`, `variant = "v6"`. Dropping the variant turns
+        // it into a bare `arm`, which normalizes to v7 — so a correctly built
+        // ARMv6 image would look like a mismatch and be rejected.
+        let platform = match inspect.variant.as_deref().map(str::trim) {
+            Some(variant) if !variant.is_empty() => {
+                crate::platform::normalize_platform(&os, &format!("{}/{}", architecture, variant))
+            }
+            _ => crate::platform::normalize_platform(&os, &architecture),
+        };
 
         let size_bytes = inspect.size.map(|s| s as u64).unwrap_or(0);
 
