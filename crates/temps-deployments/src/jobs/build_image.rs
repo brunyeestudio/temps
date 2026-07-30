@@ -71,6 +71,15 @@ pub struct ImageOutput {
     pub size_bytes: u64,
     pub build_context: PathBuf,
     pub dockerfile_path: PathBuf,
+    /// Every tag this build produced, keyed by canonical platform.
+    ///
+    /// Empty for a single-platform build (the default): `image_tag` is then
+    /// the whole story. On a heterogeneous cluster it holds one entry per
+    /// architecture — the first platform keeps the plain `image_tag`, the rest
+    /// get `-<arch>` suffixed tags — and the deploy job picks the entry that
+    /// matches each node.
+    #[serde(default)]
+    pub image_tags_by_platform: HashMap<String, String>,
 }
 
 impl ImageOutput {
@@ -106,12 +115,17 @@ impl ImageOutput {
                 WorkflowError::JobValidationFailed("dockerfile_path output not found".to_string())
             })?;
 
+        let image_tags_by_platform: HashMap<String, String> = context
+            .get_output(build_job_id, "image_tags_by_platform")?
+            .unwrap_or_default();
+
         Ok(Self {
             image_tag,
             image_id,
             size_bytes,
             build_context: PathBuf::from(build_context_str),
             dockerfile_path: PathBuf::from(dockerfile_path_str),
+            image_tags_by_platform,
         })
     }
 }
@@ -123,7 +137,15 @@ pub struct BuildConfig {
     pub build_context: Option<String>,
     pub build_args: Vec<(String, String)>,
     pub build_args_buildkit: Vec<(String, String)>,
-    pub target_platform: Option<String>,
+    /// Container platforms to build for, in priority order.
+    ///
+    /// Empty (the default) builds exactly once, on the daemon's native
+    /// platform — identical to the behaviour before multi-arch support. When
+    /// populated, the **first** entry produces the plain `image_tag` and each
+    /// additional entry produces a `-<arch>` suffixed tag. Non-native entries
+    /// are built through the daemon's `platform` option, which needs QEMU
+    /// binfmt handlers registered on the host.
+    pub target_platforms: Vec<String>,
     pub cache_from: Vec<String>,
 }
 
@@ -134,7 +156,7 @@ impl Default for BuildConfig {
             build_context: Some(".".to_string()),
             build_args: Vec::new(),
             build_args_buildkit: Vec::new(),
-            target_platform: None,
+            target_platforms: Vec::new(),
             cache_from: Vec::new(),
         }
     }
@@ -653,16 +675,6 @@ impl BuildImageJob {
             build_args_buildkit.insert(key.clone(), value.clone());
         }
 
-        let build_request = BuildRequest {
-            image_name: self.image_tag.clone(),
-            context_path: build_context.clone(),
-            dockerfile_path: Some(dockerfile_path.clone()),
-            build_args,
-            build_args_buildkit,
-            platform: self.build_config.target_platform.clone(),
-            log_path: log_path.clone(),
-        };
-
         // Create log callback to stream Docker build output to job logs with structured logging
         let log_service = self.log_service.clone();
         let log_id = self.log_id.clone();
@@ -683,48 +695,163 @@ impl BuildImageJob {
                 None
             };
 
-        let build_request_with_callback = temps_deployer::BuildRequestWithCallback {
-            request: build_request,
-            log_callback,
+        // One build per requested platform. The empty case (`None` platform)
+        // is the single-architecture path every existing deployment takes.
+        let platforms: Vec<Option<String>> = if self.build_config.target_platforms.is_empty() {
+            vec![None]
+        } else {
+            self.build_config
+                .target_platforms
+                .iter()
+                .map(|p| Some(p.clone()))
+                .collect()
         };
 
-        let build_result = self
-            .image_builder
-            .build_image_with_callback(build_request_with_callback)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to build image: {}", e))
-            })?;
+        let mut image_tags_by_platform: HashMap<String, String> = HashMap::new();
+        let mut primary: Option<temps_deployer::BuildResult> = None;
 
-        self.log(
-            context,
-            format!(
-                "Image built successfully: {} ({})",
-                build_result.image_name, build_result.image_id
-            ),
-        )
-        .await?;
-        self.log(
-            context,
-            format!(
-                "📊 Image size: {} MB",
-                build_result.size_bytes / (1024 * 1024)
-            ),
-        )
-        .await?;
-        self.log(
-            context,
-            format!("Build time: {} ms", build_result.build_duration_ms),
-        )
-        .await?;
+        for (index, platform) in platforms.iter().enumerate() {
+            // The first platform owns the plain tag; the rest are suffixed so
+            // several architectures can coexist in one Docker image store
+            // without a registry or manifest list.
+            let tag = match platform {
+                Some(platform) if index > 0 => format!(
+                    "{}-{}",
+                    self.image_tag,
+                    temps_deployer::platform::platform_tag_suffix(platform)
+                ),
+                _ => self.image_tag.clone(),
+            };
+
+            if let Some(platform) = platform {
+                self.log(
+                    context,
+                    format!("Building '{}' for platform {}...", tag, platform),
+                )
+                .await?;
+            }
+
+            let build_request = BuildRequest {
+                image_name: tag.clone(),
+                context_path: build_context.clone(),
+                dockerfile_path: Some(dockerfile_path.clone()),
+                build_args: build_args.clone(),
+                build_args_buildkit: build_args_buildkit.clone(),
+                platform: platform.clone(),
+                log_path: log_path.clone(),
+            };
+
+            let build_request_with_callback = temps_deployer::BuildRequestWithCallback {
+                request: build_request,
+                log_callback: log_callback.clone(),
+            };
+
+            let build_result = match self
+                .image_builder
+                .build_image_with_callback(build_request_with_callback)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    let message = Self::describe_build_failure(platform.as_deref(), &e);
+                    self.log(context, format!("ERROR: {}", message)).await?;
+                    return Err(WorkflowError::JobExecutionFailed(message));
+                }
+            };
+
+            self.log(
+                context,
+                format!(
+                    "Image built successfully: {} ({})",
+                    build_result.image_name, build_result.image_id
+                ),
+            )
+            .await?;
+            self.log(
+                context,
+                format!(
+                    "📊 Image size: {} MB",
+                    build_result.size_bytes / (1024 * 1024)
+                ),
+            )
+            .await?;
+            self.log(
+                context,
+                format!("Build time: {} ms", build_result.build_duration_ms),
+            )
+            .await?;
+
+            if let Some(platform) = platform {
+                image_tags_by_platform.insert(
+                    temps_deployer::platform::canonicalize_platform(platform),
+                    build_result.image_name.clone(),
+                );
+            }
+
+            if index == 0 {
+                primary = Some(build_result);
+            }
+        }
+
+        // `platforms` is never empty, so the first iteration always ran.
+        let primary = primary.ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(
+                "Internal error: image build produced no result".to_string(),
+            )
+        })?;
 
         Ok(ImageOutput {
-            image_tag: build_result.image_name,
-            image_id: build_result.image_id,
-            size_bytes: build_result.size_bytes,
+            image_tag: primary.image_name,
+            image_id: primary.image_id,
+            size_bytes: primary.size_bytes,
             build_context,
             dockerfile_path,
+            image_tags_by_platform,
         })
+    }
+
+    /// Turn a build failure into a message that says what to do about it.
+    ///
+    /// Cross-architecture builds go through the daemon's `platform` option,
+    /// which silently requires QEMU binfmt handlers on the host. Without them
+    /// the failure surfaces as `exec format error` from inside the build — a
+    /// message that reads like a broken Dockerfile and sends people looking in
+    /// the wrong place. When we asked for a non-native platform, say so and
+    /// give the one command that fixes it.
+    fn describe_build_failure(
+        platform: Option<&str>,
+        error: &temps_deployer::BuilderError,
+    ) -> String {
+        let Some(platform) = platform else {
+            return format!("Failed to build image: {}", error);
+        };
+
+        let native = temps_deployer::platform::native_platform();
+        if temps_deployer::platform::platforms_match(platform, &native) {
+            return format!("Failed to build image for {}: {}", platform, error);
+        }
+
+        let text = error.to_string().to_lowercase();
+        let looks_like_missing_emulation = text.contains("exec format error")
+            || text.contains("no match for platform")
+            || text.contains("cannot execute binary file")
+            || text.contains("unknown operating system or architecture");
+
+        if looks_like_missing_emulation {
+            format!(
+                "Failed to build image for {} on a {} host: {}. \
+                 Cross-architecture builds need QEMU emulation registered on the build host. \
+                 Install it with: docker run --privileged --rm tonistiigi/binfmt --install {}. \
+                 Alternatively, restrict this environment to {} nodes via target nodes/labels.",
+                platform,
+                native,
+                error,
+                temps_deployer::platform::platform_arch(platform),
+                native
+            )
+        } else {
+            format!("Failed to build image for {}: {}", platform, error)
+        }
     }
 }
 
@@ -766,6 +893,13 @@ impl WorkflowTask for BuildImageJob {
             &self.job_id,
             "dockerfile_path",
             image_output.dockerfile_path.to_string_lossy().to_string(),
+        )?;
+        // Only meaningful for a multi-arch build; an empty map downstream means
+        // "one tag covers everything", which is what single-arch builds want.
+        context.set_output(
+            &self.job_id,
+            "image_tags_by_platform",
+            &image_output.image_tags_by_platform,
         )?;
 
         // Read .temps.yaml health config and pass it to downstream jobs
@@ -942,8 +1076,8 @@ impl BuildImageJobBuilder {
         self
     }
 
-    pub fn target_platform(mut self, target_platform: String) -> Self {
-        self.build_config.target_platform = Some(target_platform);
+    pub fn target_platforms(mut self, target_platforms: Vec<String>) -> Self {
+        self.build_config.target_platforms = target_platforms;
         self
     }
 
@@ -1134,6 +1268,238 @@ mod tests {
 
         assert_eq!(job.preset, Some(StoredPreset::Nixpacks));
         assert_eq!(job.preset_config, Some(config));
+    }
+
+    /// Records every platform the job asked for, so a test can assert what a
+    /// multi-arch build actually did.
+    #[derive(Default)]
+    struct RecordingImageBuilder {
+        builds: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        /// Platforms whose build should fail, with this error text.
+        fail_platform: Option<(String, String)>,
+    }
+
+    impl RecordingImageBuilder {
+        fn builds(&self) -> Vec<(String, Option<String>)> {
+            self.builds.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ImageBuilder for RecordingImageBuilder {
+        async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
+            self.builds
+                .lock()
+                .unwrap()
+                .push((request.image_name.clone(), request.platform.clone()));
+
+            if let (Some((fail_platform, message)), Some(requested)) =
+                (self.fail_platform.as_ref(), request.platform.as_deref())
+            {
+                if fail_platform == requested {
+                    return Err(BuilderError::BuildFailed(message.clone()));
+                }
+            }
+
+            Ok(BuildResult {
+                image_id: format!("sha256:{}", request.image_name),
+                image_name: request.image_name,
+                size_bytes: 1024 * 1024,
+                build_duration_ms: 1,
+            })
+        }
+
+        async fn build_image_with_callback(
+            &self,
+            request: BuildRequestWithCallback,
+        ) -> Result<BuildResult, BuilderError> {
+            self.build_image(request.request).await
+        }
+
+        async fn import_image(
+            &self,
+            _image_path: PathBuf,
+            _tag: &str,
+        ) -> Result<String, BuilderError> {
+            Ok("sha256:imported".to_string())
+        }
+
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &Path,
+        ) -> Result<(), BuilderError> {
+            Ok(())
+        }
+
+        async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
+            Ok(vec![])
+        }
+
+        async fn remove_image(&self, _image_name: &str) -> Result<(), BuilderError> {
+            Ok(())
+        }
+
+        async fn inspect_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, BuilderError> {
+            Err(BuilderError::ImageNotFound("not used in this test".into()))
+        }
+
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &Path,
+        ) -> Result<(), BuilderError> {
+            Ok(())
+        }
+
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".to_string()
+        }
+    }
+
+    /// Build context with a trivial Dockerfile, so `build_image` doesn't try to
+    /// generate one from a preset.
+    fn repo_with_dockerfile() -> (tempfile::TempDir, RepositoryOutput) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let repo = RepositoryOutput {
+            repo_dir: dir.path().to_path_buf(),
+            checkout_ref: "main".to_string(),
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+        };
+        (dir, repo)
+    }
+
+    /// Single-platform builds must keep behaving exactly as before: one build,
+    /// the plain tag, no per-platform map.
+    #[tokio::test]
+    async fn test_build_without_target_platforms_builds_once() {
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build(builder.clone())
+            .unwrap();
+
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let output = job.build_image(&repo, &context).await.unwrap();
+
+        assert_eq!(builder.builds(), vec![("myapp:latest".to_string(), None)]);
+        assert_eq!(output.image_tag, "myapp:latest");
+        assert!(output.image_tags_by_platform.is_empty());
+    }
+
+    /// A heterogeneous cluster builds one image per architecture. The first
+    /// platform keeps the plain tag so single-arch consumers are unaffected;
+    /// the rest are suffixed so both can coexist in one image store without a
+    /// registry or manifest list.
+    #[tokio::test]
+    async fn test_multi_platform_build_produces_one_tag_per_platform() {
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .target_platforms(vec!["linux/amd64".to_string(), "linux/arm64".to_string()])
+            .build(builder.clone())
+            .unwrap();
+
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let output = job.build_image(&repo, &context).await.unwrap();
+
+        assert_eq!(
+            builder.builds(),
+            vec![
+                ("myapp:latest".to_string(), Some("linux/amd64".to_string())),
+                (
+                    "myapp:latest-arm64".to_string(),
+                    Some("linux/arm64".to_string())
+                ),
+            ]
+        );
+
+        // The primary output stays the native tag...
+        assert_eq!(output.image_tag, "myapp:latest");
+        // ...and every platform is resolvable for the deploy job.
+        assert_eq!(
+            output.image_tags_by_platform.get("linux/amd64").unwrap(),
+            "myapp:latest"
+        );
+        assert_eq!(
+            output.image_tags_by_platform.get("linux/arm64").unwrap(),
+            "myapp:latest-arm64"
+        );
+    }
+
+    /// A failed cross-build must not leave a half-built deployment looking
+    /// successful: the job fails, and the message points at the missing
+    /// emulation rather than at the Dockerfile.
+    #[tokio::test]
+    async fn test_cross_build_failure_fails_the_job_with_a_hint() {
+        let builder = Arc::new(RecordingImageBuilder {
+            builds: Default::default(),
+            fail_platform: Some(("linux/arm64".to_string(), "exec format error".to_string())),
+        });
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .target_platforms(vec!["linux/amd64".to_string(), "linux/arm64".to_string()])
+            .build(builder.clone())
+            .unwrap();
+
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let err = job.build_image(&repo, &context).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("tonistiigi/binfmt"),
+            "operator needs the fix command, got: {}",
+            message
+        );
+        assert!(message.contains("linux/arm64"), "got: {}", message);
+    }
+
+    #[test]
+    fn test_describe_build_failure_mentions_emulation_only_for_cross_builds() {
+        let native = temps_deployer::platform::native_platform();
+
+        // Native build: plain error, no misleading emulation advice.
+        let native_msg = BuildImageJob::describe_build_failure(
+            Some(&native),
+            &BuilderError::BuildFailed("exec format error".into()),
+        );
+        assert!(!native_msg.contains("binfmt"), "got: {}", native_msg);
+
+        // Cross build failing for an unrelated reason: no emulation advice
+        // either — don't send people chasing the wrong fix.
+        let other = if native == "linux/amd64" {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        };
+        let unrelated = BuildImageJob::describe_build_failure(
+            Some(other),
+            &BuilderError::BuildFailed("npm ERR! missing script: build".into()),
+        );
+        assert!(!unrelated.contains("binfmt"), "got: {}", unrelated);
+        assert!(unrelated.contains(other), "got: {}", unrelated);
+
+        // No platform requested at all (single-arch path).
+        let plain =
+            BuildImageJob::describe_build_failure(None, &BuilderError::BuildFailed("boom".into()));
+        assert_eq!(plain, "Failed to build image: Build failed: boom");
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub fn build_router(
     config: &AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
     overlay_peers: crate::network_sync::SharedPeers,
+    platform: String,
 ) -> Router {
     let state = Arc::new(AgentState {
         container_deployer,
@@ -31,6 +32,7 @@ pub fn build_router(
         docker,
         overlay_bridge_address,
         overlay_peers,
+        platform,
     });
 
     let auth = Arc::new(AgentAuth::new(&config.token));
@@ -135,6 +137,7 @@ const HEARTBEAT_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 fn spawn_heartbeat_loop(
     config: &AgentConfig,
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    platform: String,
 ) {
     let control_plane_url = config.control_plane_url.clone();
     let node_id = config.node_id;
@@ -170,7 +173,15 @@ fn spawn_heartbeat_loop(
             interval.tick().await;
 
             let capacity = collect_capacity_metrics();
-            let mut body = serde_json::json!({ "capacity": capacity, "labels": labels });
+            // `architecture` goes out on EVERY beat, not just registration:
+            // it's how a node upgraded from a pre-multi-arch agent (which
+            // left the column NULL) becomes schedulable with confidence, and
+            // how a re-pointed DOCKER_HOST is picked up without re-joining.
+            let mut body = serde_json::json!({
+                "capacity": capacity,
+                "labels": labels,
+                "architecture": platform,
+            });
 
             // On the first heartbeat (agent startup/reconnect), include a full
             // container inventory so the control plane can reconcile stale state.
@@ -309,6 +320,55 @@ fn spawn_heartbeat_loop(
     });
 }
 
+/// Resolve the container platform this agent can actually run images for.
+///
+/// The source of truth is the Docker **daemon** (`docker info`), not this
+/// process: an agent may drive a daemon over `DOCKER_HOST`, or a
+/// QEMU-emulated `docker:dind`, whose architecture differs from the binary's.
+/// Placing an image is decided by the daemon, so that is what we report.
+///
+/// Falls back to the compiled-in architecture when Docker is unreachable —
+/// a wrong-but-plausible value beats no value, since the control plane treats
+/// a missing platform as "unknown, assume compatible" and would schedule here
+/// anyway.
+pub async fn detect_agent_platform(docker: Option<&bollard::Docker>) -> String {
+    let fallback = temps_deployer::platform::native_platform();
+
+    let Some(docker) = docker else {
+        tracing::warn!(
+            "No Docker client available; reporting this binary's platform ({}) to the control plane",
+            fallback
+        );
+        return fallback;
+    };
+
+    match docker.info().await {
+        Ok(info) => {
+            let os = info.os_type.unwrap_or_else(|| "linux".to_string());
+            match info.architecture {
+                Some(arch) => temps_deployer::platform::normalize_platform(&os, &arch),
+                None => {
+                    tracing::warn!(
+                        "Docker daemon reported no architecture; \
+                         reporting this binary's platform ({})",
+                        fallback
+                    );
+                    fallback
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not read Docker daemon info ({}); \
+                 reporting this binary's platform ({})",
+                e,
+                fallback
+            );
+            fallback
+        }
+    }
+}
+
 /// Collect system resource metrics for heartbeat capacity data.
 fn collect_capacity_metrics() -> serde_json::Value {
     use sysinfo::{Disks, System};
@@ -344,6 +404,14 @@ pub async fn start_agent_server(
     overlay_peers: crate::network_sync::SharedPeers,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 ) -> Result<(), crate::AgentError> {
+    // Resolve the daemon's platform once, before anything can report it.
+    let platform = detect_agent_platform(docker.as_ref()).await;
+    tracing::info!(
+        node = %config.node_name,
+        platform = %platform,
+        "Agent container platform detected"
+    );
+
     let router = build_router(
         container_deployer.clone(),
         image_builder,
@@ -351,10 +419,11 @@ pub async fn start_agent_server(
         &config,
         overlay_bridge_address.clone(),
         overlay_peers.clone(),
+        platform.clone(),
     );
 
     // Start heartbeat background loop (with deployer for container inventory on first beat)
-    spawn_heartbeat_loop(&config, container_deployer);
+    spawn_heartbeat_loop(&config, container_deployer, platform);
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
     // agent — when this node has no compute_cidr allocated (single-host

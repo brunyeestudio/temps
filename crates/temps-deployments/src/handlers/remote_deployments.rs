@@ -28,7 +28,7 @@ use temps_entities::deployments::DeploymentMetadata;
 use temps_entities::source_type::SourceType;
 use temps_entities::types::PipelineStatus;
 use temps_entities::{deployments, environments, projects};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBundleInfo};
@@ -148,6 +148,83 @@ pub struct DeployFromImageUploadQuery {
 /// - Capped at 2048 bytes
 ///
 /// Returns a 400 `Problem` on failure.
+/// Reject an uploaded image only when **no** node in the cluster could run it.
+///
+/// The control plane's own platform is always a candidate (it is a scheduling
+/// target), plus the architecture of every active worker node. An image
+/// matching any of them is accepted; the scheduler then places it on a node
+/// that can actually execute it.
+///
+/// Failing to inspect the image, or to list nodes, is not treated as a
+/// rejection — a transient database error must not turn a valid upload into a
+/// 400. The deploy path re-checks the architecture before transferring to a
+/// node, so a genuinely unrunnable image still fails there, with context.
+async fn validate_uploaded_image_platform(
+    state: &Arc<AppState>,
+    image_tag: &str,
+) -> Result<(), Problem> {
+    let image_platform = match state.image_builder.inspect_image(image_tag).await {
+        Ok(info) => info.platform,
+        Err(e) => {
+            warn!(
+                image = %image_tag,
+                "Could not inspect uploaded image to validate its platform: {}", e
+            );
+            return Ok(());
+        }
+    };
+
+    let local_platform = state.image_builder.get_native_platform();
+    let mut cluster_platforms = vec![local_platform.clone()];
+
+    match state.node_service.list_active(90).await {
+        Ok(nodes) => {
+            for node in nodes {
+                if let Some(architecture) = node.architecture {
+                    if !cluster_platforms.contains(&architecture) {
+                        cluster_platforms.push(architecture);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Could not list active nodes while validating uploaded image platform: {}",
+                e
+            );
+        }
+    }
+
+    if cluster_platforms
+        .iter()
+        .any(|p| temps_deployer::platform::platforms_match(p, &image_platform))
+    {
+        info!(
+            image = %image_tag,
+            platform = %image_platform,
+            "Image platform validation passed"
+        );
+        return Ok(());
+    }
+
+    error!(
+        image = %image_tag,
+        image_platform = %image_platform,
+        cluster_platforms = ?cluster_platforms,
+        "Rejecting uploaded image: no node in the cluster runs its architecture"
+    );
+    Err(problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_title("Platform Mismatch")
+        .with_detail(format!(
+            "The uploaded image is built for {}, but no node in this cluster runs that \
+             architecture (available: {}). Rebuild the image for one of those platforms, \
+             or join a {} worker node first.",
+            image_platform,
+            cluster_platforms.join(", "),
+            image_platform
+        )))
+}
+
 fn validate_health_check_path(path: &str) -> Result<(), Problem> {
     let invalid = |detail: &str| {
         problemdetails::new(StatusCode::BAD_REQUEST)
@@ -1047,23 +1124,13 @@ pub async fn deploy_from_image_upload(
         imported_image_id, image_tag
     );
 
-    // 7. Validate image platform matches the target platform
-    if let Err(e) = state
-        .image_builder
-        .validate_image_platform(&image_tag)
-        .await
-    {
-        error!("Image platform validation failed: {}", e);
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Platform Mismatch")
-            .with_detail(format!(
-                "The uploaded image architecture does not match the target platform. {}. \
-                Please ensure you're uploading an image built for the correct architecture.",
-                e
-            )));
-    }
-
-    info!("Image platform validation passed for tag: {}", image_tag);
+    // 7. Validate the image can run *somewhere* in this cluster.
+    //
+    // This deliberately checks against every node's architecture, not just the
+    // control plane's: on a mixed cluster an arm64 image is perfectly valid
+    // when an arm64 worker exists, and rejecting it because the control plane
+    // is amd64 would block a legitimate deploy.
+    validate_uploaded_image_platform(&state, &image_tag).await?;
 
     // 8. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)

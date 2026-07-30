@@ -168,6 +168,18 @@ impl TempsPlugin for DeployerPlugin {
                 );
             }
 
+            // Learn the daemon's architecture once, up front: every later
+            // `get_native_platform()` call is synchronous (the `ImageBuilder`
+            // trait requires it) and would otherwise answer with the binary's
+            // architecture, which is wrong whenever `DOCKER_HOST` points at a
+            // daemon on another machine. The scheduler and the pre-transfer
+            // platform check both depend on this value being the daemon's.
+            let daemon_platform = docker_runtime.refresh_daemon_platform().await;
+            tracing::info!(
+                platform = %daemon_platform,
+                "Control-plane container platform detected"
+            );
+
             // ADR-024: optionally start the control-plane DNS resolver so
             // containers deployed locally on the control plane — and every
             // single-node install — can resolve `*.temps.local`.

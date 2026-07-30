@@ -7950,6 +7950,12 @@ export type HealthSummary = {
 
 export type HeartbeatApiRequest = {
     /**
+     * Container platform of this node's Docker daemon (`linux/amd64`,
+     * `linux/arm64`), read from `docker info` by the agent. Absent from
+     * pre-multi-arch agents; the stored value is then left untouched.
+     */
+    architecture?: string | null;
+    /**
      * Resource capacity/usage info as JSON (cpu_usage, memory_usage, etc.)
      */
     capacity?: unknown;
@@ -10039,6 +10045,11 @@ export type NodeCostInfo = {
 
 export type NodeInfoResponse = {
     address: string;
+    /**
+     * Container platform this node runs (`linux/amd64`, `linux/arm64`).
+     * `None` until an agent that reports it has heartbeated.
+     */
+    architecture?: string | null;
     /**
      * Resource capacity/usage metrics from the latest heartbeat
      */
@@ -12752,6 +12763,12 @@ export type RegisterNodeApiRequest = {
      * Node's reachable address (e.g., "10.100.0.2" or "192.168.1.50")
      */
     address: string;
+    /**
+     * Container platform of this node's Docker daemon (`linux/amd64`,
+     * `linux/arm64`). Optional: agents older than multi-arch support omit it
+     * and the value is learned from the first heartbeat instead.
+     */
+    architecture?: string | null;
     /**
      * Node-generated certificate signing request (PEM) for multi-node mTLS
      * (ADR-020 WS-2.1). When present, the control plane signs it with the

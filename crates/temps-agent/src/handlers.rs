@@ -45,6 +45,12 @@ pub struct AgentState {
     /// per-peer routes inside each new container's netns. Empty until
     /// the first successful network/peers poll.
     pub overlay_peers: crate::network_sync::SharedPeers,
+    /// Container platform of the Docker daemon this agent drives, in OCI form
+    /// (`linux/amd64`, `linux/arm64`). Resolved once at startup from
+    /// `docker info` (see [`crate::server::detect_agent_platform`]) and
+    /// reported to the control plane on every heartbeat plus in the health
+    /// report, so the scheduler never places an image this node cannot run.
+    pub platform: String,
 }
 
 /// Response wrapper for consistent agent API responses.
@@ -1109,5 +1115,6 @@ async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
         disk_used_bytes: disk_used,
         disk_total_bytes: disk_total,
         running_containers,
+        platform: state.platform.clone(),
     }
 }

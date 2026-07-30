@@ -153,6 +153,14 @@ pub struct DockerRuntime {
     /// Per-build resource override forwarded to `BuildImageOptions`. None
     /// preserves the legacy 50%-of-host heuristic in `get_resource_limits`.
     build_resource_override: Option<BuildResourceLimits>,
+    /// Platform of the Docker *daemon* this runtime talks to, cached after the
+    /// first `docker info`. This is deliberately not the platform of the
+    /// binary: with `DOCKER_HOST` set (or a QEMU-emulated `docker:dind`), the
+    /// daemon can be a different architecture than the process, and what
+    /// decides whether an image will run is the daemon's. Populated by
+    /// [`Self::refresh_daemon_platform`]; until then `get_native_platform`
+    /// falls back to the compiled-in architecture.
+    daemon_platform: Arc<std::sync::OnceLock<String>>,
 }
 
 /// Explicit per-build resource caps, set by the control plane from
@@ -438,7 +446,57 @@ impl DockerRuntime {
             secrets_root,
             build_semaphore: None,
             build_resource_override: None,
+            daemon_platform: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Query the Docker daemon for its platform and cache it.
+    ///
+    /// Called once during startup (control-plane deployer plugin, agent
+    /// server) so every later `get_native_platform()` — which the
+    /// `ImageBuilder` trait requires to be synchronous — answers with the
+    /// daemon's real architecture instead of the binary's.
+    ///
+    /// Failures are non-fatal: we log and keep the compiled-in fallback, since
+    /// a transient `docker info` error must not stop the node from booting.
+    pub async fn refresh_daemon_platform(&self) -> String {
+        if let Some(cached) = self.daemon_platform.get() {
+            return cached.clone();
+        }
+
+        let platform = match self.docker.info().await {
+            Ok(info) => {
+                let os = info.os_type.unwrap_or_else(|| "linux".to_string());
+                match info.architecture {
+                    Some(arch) => crate::platform::normalize_platform(&os, &arch),
+                    None => {
+                        warn!(
+                            "Docker daemon reported no architecture; \
+                             falling back to this binary's platform ({})",
+                            crate::platform::native_platform()
+                        );
+                        crate::platform::native_platform()
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Could not read the Docker daemon platform ({}); \
+                     falling back to this binary's platform ({})",
+                    e,
+                    crate::platform::native_platform()
+                );
+                crate::platform::native_platform()
+            }
+        };
+
+        // A concurrent caller may have won the race — its value is equally
+        // valid, so keep whichever landed first.
+        let _ = self.daemon_platform.set(platform.clone());
+        self.daemon_platform
+            .get()
+            .cloned()
+            .unwrap_or_else(crate::platform::native_platform)
     }
 
     /// Apply build concurrency + per-build resource caps. Called by the
@@ -808,22 +866,16 @@ impl DockerRuntime {
         (memory_bytes, cpu_quota_us, CPU_PERIOD_US)
     }
 
-    /// Detect the native platform for Docker builds
-    /// Returns the platform string in the format "linux/arch"
-    fn detect_native_platform() -> String {
-        #[cfg(target_arch = "x86_64")]
-        {
-            "linux/amd64".to_string()
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            "linux/arm64".to_string()
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            // Fallback to amd64 for other architectures
-            "linux/amd64".to_string()
-        }
+    /// Detect the native platform for Docker builds.
+    ///
+    /// Prefers the daemon platform learned by [`Self::refresh_daemon_platform`]
+    /// and falls back to this binary's architecture before that runs (or when
+    /// `docker info` failed).
+    fn detect_native_platform(&self) -> String {
+        self.daemon_platform
+            .get()
+            .cloned()
+            .unwrap_or_else(crate::platform::native_platform)
     }
 
     async fn concat_byte_stream<S>(s: S) -> Result<Vec<u8>, bollard::errors::Error>
@@ -996,7 +1048,8 @@ impl ImageBuilder for DockerRuntime {
             },
             platform: request
                 .platform
-                .unwrap_or_else(Self::detect_native_platform),
+                .clone()
+                .unwrap_or_else(|| self.detect_native_platform()),
             memory: Some(memory_i32),
             cpuquota: Some(cpu_quota_us),
             cpuperiod: Some(cpu_period_us),
@@ -1177,7 +1230,8 @@ impl ImageBuilder for DockerRuntime {
             },
             platform: request
                 .platform
-                .unwrap_or_else(Self::detect_native_platform),
+                .clone()
+                .unwrap_or_else(|| self.detect_native_platform()),
             memory: Some(memory_i32),
             cpuquota: Some(cpu_quota_us),
             cpuperiod: Some(cpu_period_us),
@@ -1609,7 +1663,7 @@ impl ImageBuilder for DockerRuntime {
     }
 
     fn get_native_platform(&self) -> String {
-        Self::detect_native_platform()
+        self.detect_native_platform()
     }
 }
 
@@ -3091,7 +3145,9 @@ mod docker_tests {
 
     #[test]
     fn test_native_platform_detection() {
-        let platform = DockerRuntime::detect_native_platform();
+        // Before `refresh_daemon_platform` runs, detection falls back to the
+        // architecture this binary was compiled for.
+        let platform = test_runtime().detect_native_platform();
 
         // Verify platform format
         assert!(platform.starts_with("linux/"));
@@ -3115,6 +3171,29 @@ mod docker_tests {
             "Platform should be either linux/amd64 or linux/arm64, got: {}",
             platform
         );
+    }
+
+    /// The daemon's platform — not the binary's — is what decides whether an
+    /// image will run, so `get_native_platform` must reflect `docker info`
+    /// once it has been refreshed.
+    #[tokio::test]
+    async fn test_refresh_daemon_platform_reads_docker_info() {
+        let runtime = test_runtime();
+        if runtime.docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        let platform = runtime.refresh_daemon_platform().await;
+        assert!(
+            platform.starts_with("linux/"),
+            "expected a linux platform, got: {}",
+            platform
+        );
+        // Cached: the trait method now answers with the daemon's platform.
+        assert_eq!(runtime.get_native_platform(), platform);
+        // And it is stable across calls (OnceLock, no re-query).
+        assert_eq!(runtime.refresh_daemon_platform().await, platform);
     }
 
     #[tokio::test]

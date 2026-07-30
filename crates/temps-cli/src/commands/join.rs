@@ -137,6 +137,46 @@ fn persist_tls(
     Some(paths)
 }
 
+/// Detect the container platform this machine will run workloads on.
+///
+/// Reads it from the local Docker daemon, which is the architecture that
+/// actually decides whether an image can run here — the CLI binary's own
+/// architecture is only a fallback for when Docker isn't reachable yet (the
+/// agent re-reports the real value on its first heartbeat).
+async fn detect_local_platform() -> String {
+    let fallback = temps_deployer::platform::native_platform();
+
+    let docker = match bollard::Docker::connect_with_defaults() {
+        Ok(docker) => docker,
+        Err(e) => {
+            eprintln!(
+                "Warning: could not connect to Docker ({}); reporting {} from this binary. \
+                 The agent will correct this on its first heartbeat.",
+                e, fallback
+            );
+            return fallback;
+        }
+    };
+
+    match docker.info().await {
+        Ok(info) => {
+            let os = info.os_type.unwrap_or_else(|| "linux".to_string());
+            match info.architecture {
+                Some(arch) => temps_deployer::platform::normalize_platform(&os, &arch),
+                None => fallback,
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read Docker info ({}); reporting {} from this binary. \
+                 The agent will correct this on its first heartbeat.",
+                e, fallback
+            );
+            fallback
+        }
+    }
+}
+
 impl JoinCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -156,10 +196,17 @@ impl JoinCommand {
 
         println!("Joining Temps cluster as '{}'...", node_name);
 
+        // Report the container platform at join time so the control plane can
+        // schedule correctly from the very first deploy, instead of waiting up
+        // to 30s for the first heartbeat to reveal the architecture.
+        let platform = detect_local_platform().await;
+        println!("Container platform: {}", platform);
+
         if let Some(private_addr) = self.private_address.clone() {
-            self.join_direct(&node_name, &private_addr, &labels).await?;
+            self.join_direct(&node_name, &private_addr, &labels, &platform)
+                .await?;
         } else {
-            self.join_via_relay(&node_name, &labels).await?;
+            self.join_via_relay(&node_name, &labels, &platform).await?;
         }
 
         Ok(())
@@ -200,6 +247,7 @@ impl JoinCommand {
         node_name: &str,
         private_address: &str,
         labels: &serde_json::Value,
+        platform: &str,
     ) -> anyhow::Result<()> {
         println!(
             "Using direct mode with private address: {}",
@@ -232,6 +280,7 @@ impl JoinCommand {
             "address": format!("http://{}:{}", private_address.trim(), self.agent_address.split(':').next_back().unwrap_or("3100").trim()),
             "private_address": private_address,
             "labels": labels,
+            "architecture": platform,
             "csr_pem": tls_material.as_ref().map(|m| m.csr_pem.clone()),
         });
 
@@ -309,6 +358,7 @@ impl JoinCommand {
         &self,
         node_name: &str,
         labels: &serde_json::Value,
+        platform: &str,
     ) -> anyhow::Result<()> {
         println!("Using relay mode via {}...", self.relay_url);
 
@@ -417,6 +467,7 @@ impl JoinCommand {
             "wg_public_key": keypair.public_key,
             "public_endpoint": public_endpoint,
             "labels": labels,
+            "architecture": platform,
             "csr_pem": tls_material.as_ref().map(|m| m.csr_pem.clone()),
         });
 

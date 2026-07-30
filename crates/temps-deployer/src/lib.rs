@@ -21,10 +21,16 @@ pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
 pub mod static_deployer;
+
+pub use platform::{
+    canonicalize_platform, native_platform, normalize_arch, normalize_platform, platform_arch,
+    platform_tag_suffix, platforms_match, tag_for_platform,
+};
 
 #[derive(Error, Debug)]
 pub enum BuilderError {

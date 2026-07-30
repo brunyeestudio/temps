@@ -26,6 +26,18 @@ pub enum NodeError {
     #[error("Node '{name}' is currently active; re-registering a different identity (token/address/WireGuard key) requires proof of the current token, or the node must be drained/removed first")]
     IdentityConflict { name: String },
 
+    #[error(
+        "No node can run this image: it was built for [{image_platforms}], \
+         the control plane runs {local_platform}, and no active worker node \
+         reports a matching architecture"
+    )]
+    NoCompatibleNode {
+        /// Platforms the image exists for, comma-separated.
+        image_platforms: String,
+        /// Platform of the control plane, or "unknown" when not declared.
+        local_platform: String,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -45,6 +57,10 @@ pub struct RegisterNodeRequest {
     pub labels: serde_json::Value,
     /// X25519 public key for ECIES certificate encryption (edge nodes only)
     pub edge_public_key: Option<String>,
+    /// Container platform of the node's Docker daemon (`linux/amd64`,
+    /// `linux/arm64`). `None` from agents older than multi-arch support —
+    /// the next heartbeat fills it in.
+    pub architecture: Option<String>,
     /// SHA-256 hash of the node's *current* token, supplied to prove possession
     /// when re-registering (changing identity) a node that already exists.
     /// `None` for first-time registration or when no proof is offered.
@@ -58,6 +74,10 @@ pub struct HeartbeatRequest {
     pub capacity: serde_json::Value,
     /// Updated labels from the agent (allows runtime label changes without re-registration).
     pub labels: Option<serde_json::Value>,
+    /// Container platform reported by the agent (`linux/amd64`, `linux/arm64`).
+    /// `None` from a pre-multi-arch agent; in that case the stored value is
+    /// left untouched rather than cleared, so an operator-set value survives.
+    pub architecture: Option<String>,
 }
 
 /// A node whose last heartbeat is within this window (and still marked
@@ -181,6 +201,12 @@ impl NodeService {
             active.wg_public_key = Set(request.wg_public_key);
             active.labels = Set(request.labels);
             active.edge_public_key = Set(request.edge_public_key);
+            // Only overwrite a known architecture when the agent actually
+            // reported one — a pre-multi-arch agent re-joining must not wipe
+            // the platform we already learned.
+            if let Some(architecture) = request.architecture {
+                active.architecture = Set(Some(architecture));
+            }
             active.status = Set("active".to_string());
             active.last_heartbeat = Set(Some(chrono::Utc::now()));
 
@@ -210,6 +236,7 @@ impl NodeService {
             capacity: Set(serde_json::json!({})),
             last_heartbeat: Set(Some(chrono::Utc::now())),
             edge_public_key: Set(request.edge_public_key),
+            architecture: Set(request.architecture),
             ..Default::default()
         };
 
@@ -247,6 +274,19 @@ impl NodeService {
         }
         if let Some(labels) = request.labels {
             active.labels = Set(labels);
+        }
+        // Same rule as registration: absent means "not reported", not "unset".
+        if let Some(architecture) = request.architecture {
+            if node.architecture.as_deref() != Some(architecture.as_str()) {
+                tracing::info!(
+                    node_id,
+                    node_name = %node.name,
+                    previous = ?node.architecture,
+                    architecture = %architecture,
+                    "Node container platform recorded"
+                );
+            }
+            active.architecture = Set(Some(architecture));
         }
         active.update(self.db.as_ref()).await?;
 
@@ -701,6 +741,7 @@ mod tests {
 
     fn sample_node() -> nodes::Model {
         nodes::Model {
+            architecture: None,
             id: 1,
             name: "worker-1".to_string(),
             token_hash: "hash123".to_string(),
@@ -725,6 +766,7 @@ mod tests {
     /// Build a register request with sensible defaults for tests.
     fn register_req(name: &str, token_hash: &str, address: &str) -> RegisterNodeRequest {
         RegisterNodeRequest {
+            architecture: None,
             name: name.to_string(),
             token_hash: token_hash.to_string(),
             token_encrypted: None,
@@ -1121,6 +1163,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                 },
@@ -1147,6 +1190,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                 },
