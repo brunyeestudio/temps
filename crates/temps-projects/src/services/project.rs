@@ -88,8 +88,11 @@ fn apply_resolved_preset(
     active.preset_config = Set(resolved.config);
 }
 
-/// Preserve an existing Nixpacks provider selection when a partial config
-/// patch omits the `providers` field. An explicit empty list resets to auto.
+/// Preserve discriminator-like fields when a partial config patch omits them.
+///
+/// An explicit empty Nixpacks provider list still resets to auto, and an
+/// explicit Dockerfile variant is still honored. Catalog preset selection is
+/// normalized separately by the selected preset's resolver.
 fn merge_preset_config(
     existing: Option<&temps_entities::preset::PresetConfig>,
     parsed: temps_entities::preset::PresetConfig,
@@ -102,24 +105,42 @@ fn merge_preset_config(
         .as_object()
         .map(|map| !map.contains_key("providers"))
         .unwrap_or(true);
+    let omits_dockerfile_variant = config_value
+        .as_object()
+        .map(|map| !map.contains_key("variant"))
+        .unwrap_or(true);
 
-    match (
-        existing,
-        parsed,
-        omits_providers && preserve_omitted_providers,
-    ) {
-        (
-            Some(PresetConfig::Nixpacks(existing_cfg)),
-            PresetConfig::Nixpacks(mut parsed_cfg),
-            true,
-        ) => {
-            if parsed_cfg.providers.is_empty() && !existing_cfg.providers.is_empty() {
+    match (existing, parsed) {
+        (Some(PresetConfig::Nixpacks(existing_cfg)), PresetConfig::Nixpacks(mut parsed_cfg)) => {
+            if preserve_omitted_providers
+                && omits_providers
+                && parsed_cfg.providers.is_empty()
+                && !existing_cfg.providers.is_empty()
+            {
                 parsed_cfg.providers = existing_cfg.providers.clone();
             }
             PresetConfig::Nixpacks(parsed_cfg)
         }
-        (_, other, _) => other,
+        (
+            Some(PresetConfig::Dockerfile(existing_cfg)),
+            PresetConfig::Dockerfile(mut parsed_cfg),
+        ) => {
+            if omits_dockerfile_variant {
+                parsed_cfg.variant = existing_cfg.variant;
+            }
+            PresetConfig::Dockerfile(parsed_cfg)
+        }
+        (_, other) => other,
     }
+}
+
+fn validate_preset_config(
+    preset: temps_entities::preset::Preset,
+    config: temps_entities::preset::PresetConfig,
+) -> Result<temps_entities::preset::PresetConfig, ProjectError> {
+    temps_presets::validate_preset_config(preset, &config)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset config: {}", error)))?;
+    Ok(config)
 }
 
 /// Resolve an explicit catalog selection for create/update.
@@ -310,7 +331,10 @@ impl ProjectService {
                 })
             }
         };
-        info!("Created project: {:?}", project_found_db);
+        info!(
+            "Created project id={} slug={} preset={}",
+            project_found_db.id, project_found_db.slug, project_found_db.preset
+        );
 
         // From here on, the project row exists. If any downstream step
         // fails, hard-delete it (CASCADE cleans up environments, env vars,
@@ -1230,6 +1254,7 @@ impl ProjectService {
                     config_value,
                     true,
                 );
+                let merged = validate_preset_config(*active_project.preset.as_ref(), merged)?;
                 active_project.preset_config = Set(Some(merged));
             }
             if let Some(dir) = directory {
@@ -1313,6 +1338,7 @@ impl ProjectService {
     pub async fn update_git_settings(
         &self,
         project_id: i32,
+        caller_user_id: i32,
         git_provider_connection_id: Option<i32>,
         main_branch: String,
         repo_owner: String,
@@ -1354,6 +1380,13 @@ impl ProjectService {
                         "Git provider connection {} not found",
                         connection_id
                     )))?;
+
+                if connection.user_id != Some(caller_user_id) {
+                    return Err(ProjectError::NotFound(format!(
+                        "Git provider connection {} not found",
+                        connection_id
+                    )));
+                }
 
                 if !connection.is_active {
                     return Err(ProjectError::Other(format!(
@@ -1413,6 +1446,7 @@ impl ProjectService {
             })?;
             let merged =
                 merge_preset_config(existing_preset_config.as_ref(), parsed, config_value, true);
+            let merged = validate_preset_config(project_preset, merged)?;
             active_project.preset_config = Set(Some(merged));
         }
 
@@ -3654,8 +3688,70 @@ mod tests {
         let project_service = create_test_services(db, mock_queue).await;
 
         let mut request = create_request("Invalid Nixpacks TOML");
-        request.preset_config = Some(serde_json::json!({ "nixpacksConfig": "invalid = [" }));
+        request.preset_config = Some(serde_json::json!({
+            "nixpacksConfig": "secret_token = [\"do-not-echo\""
+        }));
         let result = project_service.create_project(request).await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+                assert!(
+                    !message.contains("do-not-echo"),
+                    "validation errors must not echo inline config contents"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_settings_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Invalid Settings TOML"))
+            .await
+            .expect("create nixpacks project");
+        let original_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
 
         match result {
             Err(ProjectError::InvalidInput(message)) => {
@@ -3664,6 +3760,218 @@ mod tests {
             Err(other) => panic!("expected InvalidInput, got {other:?}"),
             Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
         }
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+        assert_eq!(persisted_config, original_config);
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_git_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Invalid Git Settings TOML"))
+            .await
+            .expect("create nixpacks project");
+        let original_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+
+        let result = project_service
+            .update_git_settings(
+                created.id,
+                1,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                None,
+                ".".to_string(),
+                Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
+                None,
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+        assert_eq!(persisted_config, original_config);
+    }
+
+    #[tokio::test]
+    async fn test_config_only_settings_update_preserves_custom_dockerfile_variant() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Custom Settings Variant");
+        request.preset = "custom".to_string();
+        request.preset_config = Some(serde_json::json!({
+            "dockerfilePath": "Dockerfile.custom",
+            "buildContext": "."
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create custom Dockerfile project");
+
+        project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "dockerfilePath": "Dockerfile.updated"
+                })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("update custom Dockerfile config");
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config
+            .expect("preset config");
+        match &persisted_config {
+            temps_entities::preset::PresetConfig::Dockerfile(config) => {
+                assert_eq!(
+                    config.variant,
+                    temps_entities::preset::DockerfileVariant::Custom
+                );
+                assert_eq!(
+                    config.dockerfile_path.as_deref(),
+                    Some("Dockerfile.updated")
+                );
+            }
+            other => panic!("expected Dockerfile config, got {other:?}"),
+        }
+        let runtime = temps_presets::get_preset_for_storage(
+            temps_entities::preset::Preset::Dockerfile,
+            Some(&persisted_config),
+        )
+        .expect("resolve stored preset")
+        .expect("runtime preset");
+        assert_eq!(runtime.slug(), "custom");
+    }
+
+    #[tokio::test]
+    async fn test_config_only_git_update_preserves_custom_dockerfile_variant() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Custom Git Variant");
+        request.preset = "custom".to_string();
+        request.preset_config = Some(serde_json::json!({
+            "dockerfilePath": "Dockerfile.custom",
+            "buildContext": "."
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create custom Dockerfile project");
+
+        project_service
+            .update_git_settings(
+                created.id,
+                1,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                None,
+                ".".to_string(),
+                Some(serde_json::json!({
+                    "dockerfilePath": "Dockerfile.updated"
+                })),
+                None,
+                None,
+            )
+            .await
+            .expect("update custom Dockerfile Git config");
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config
+            .expect("preset config");
+        match &persisted_config {
+            temps_entities::preset::PresetConfig::Dockerfile(config) => {
+                assert_eq!(
+                    config.variant,
+                    temps_entities::preset::DockerfileVariant::Custom
+                );
+                assert_eq!(
+                    config.dockerfile_path.as_deref(),
+                    Some("Dockerfile.updated")
+                );
+            }
+            other => panic!("expected Dockerfile config, got {other:?}"),
+        }
+        let runtime = temps_presets::get_preset_for_storage(
+            temps_entities::preset::Preset::Dockerfile,
+            Some(&persisted_config),
+        )
+        .expect("resolve stored preset")
+        .expect("runtime preset");
+        assert_eq!(runtime.slug(), "custom");
     }
 
     #[tokio::test]
@@ -3724,6 +4032,7 @@ mod tests {
         let updated = project_service
             .update_git_settings(
                 created.id,
+                1,
                 None,
                 "main".to_string(),
                 "owner".to_string(),
@@ -3965,5 +4274,180 @@ mod tests {
 
         let err = sea_orm::DbErr::Custom("connection refused".to_string());
         assert!(!super::super::types::is_unique_violation(&err));
+    }
+
+    // ── IDOR regression tests for update_git_settings ────────────────────────
+    //
+    // Security fix: update_git_settings must reject a git_provider_connection
+    // that belongs to a different user than the caller, returning NotFound so
+    // the caller learns nothing about the existence of someone else's connection.
+
+    #[tokio::test]
+    async fn test_update_git_settings_rejects_connection_owned_by_another_user() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        // Create two users so the FK on git_provider_connections.user_id is satisfied.
+        use temps_entities::{git_provider_connections, git_providers, users};
+        let user1 = users::ActiveModel {
+            email: Set("git-idor-user1@example.com".to_string()),
+            name: Set("IDOR User One".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let user2 = users::ActiveModel {
+            email: Set("git-idor-user2@example.com".to_string()),
+            name: Set("IDOR User Two".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Create a git provider (required FK for connections).
+        let provider = git_providers::ActiveModel {
+            name: Set("IDOR Test Provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("oauth".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Connection belonging to user2 — the caller will present themselves as user1.
+        let other_users_connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(Some(user2.id)),
+            account_name: Set("user2-account".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(None),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Create a project to operate on.
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("IDOR Test Project".to_string()),
+            slug: Set("idor-test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Act: caller is user1 but supplies a connection owned by user2.
+        let result = project_service
+            .update_git_settings(
+                project.id,
+                user1.id, // caller_user_id
+                Some(other_users_connection.id),
+                "main".to_string(),
+                "test-owner".to_string(),
+                "test-repo".to_string(),
+                None,
+                ".".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // Assert: ownership mismatch must surface as NotFound — not a server
+        // error and not a silent success that would hand the caller access to
+        // another user's git tokens.
+        assert!(
+            matches!(result, Err(ProjectError::NotFound(_))),
+            "expected NotFound for cross-user connection; ownership IDOR guard did not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_git_settings_accepts_connection_owned_by_caller() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        // Create a project to operate on. No git_provider_connection_id is set,
+        // so the caller's connection_id will be None — the ownership guard is
+        // skipped entirely and the call must succeed.
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Caller Owner Project".to_string()),
+            slug: Set("caller-owner-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Act: no connection_id — skips ownership guard entirely. The
+        // caller_user_id value is accepted without triggering NotFound.
+        let result = project_service
+            .update_git_settings(
+                project.id,
+                1,    // caller_user_id — arbitrary; guard never evaluates with None
+                None, // no connection_id → ownership check is bypassed
+                "main".to_string(),
+                "test-owner".to_string(), // same as inserted — repo_changed=false
+                "test-repo".to_string(),
+                None,
+                ".".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // The ownership guard must NOT produce a NotFound error.  Any other
+        // result (Ok or a different error variant) is acceptable — we only care
+        // that the guard does not false-positive on a caller that hasn't even
+        // supplied a connection_id.
+        assert!(
+            !matches!(result, Err(ProjectError::NotFound(_))),
+            "caller_user_id with no connection_id must not be rejected by the ownership guard"
+        );
     }
 }

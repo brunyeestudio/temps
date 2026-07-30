@@ -4,7 +4,7 @@
 //! These schemas are used in the API and validated when creating/updating projects.
 
 use serde::{Deserialize, Serialize};
-use temps_entities::preset::NixpacksProvider;
+use temps_entities::preset::{DockerfileVariant, NixpacksProvider};
 
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
@@ -15,6 +15,11 @@ use utoipa::ToSchema;
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct DockerfilePresetConfig {
+    /// Catalog variant. Normally omitted; `custom` selects the generated
+    /// Dockerfile compatibility preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<DockerfileVariant>,
+
     /// Custom Dockerfile path (relative to build context)
     /// If not specified, defaults to "Dockerfile" in the build context
     #[cfg_attr(feature = "openapi", schema(example = "docker/Dockerfile"))]
@@ -115,6 +120,7 @@ mod tests {
     #[test]
     fn test_dockerfile_config_serialization() {
         let config = DockerfilePresetConfig {
+            variant: None,
             dockerfile_path: Some("docker/Dockerfile".to_string()),
             build_context: Some("./api".to_string()),
         };
@@ -156,6 +162,7 @@ mod tests {
     #[test]
     fn test_preset_config_schema_union() {
         let dockerfile_config = PresetConfigSchema::Dockerfile(DockerfilePresetConfig {
+            variant: None,
             dockerfile_path: Some("Dockerfile.prod".to_string()),
             build_context: None,
         });

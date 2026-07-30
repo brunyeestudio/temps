@@ -155,10 +155,11 @@ impl NixpacksPreset {
         config: &NixpacksConfig,
     ) -> Result<(), crate::PresetResolutionError> {
         if let Some(value) = config.nixpacks_config.as_deref() {
-            BuildPlan::from_toml(value).map_err(|error| {
+            BuildPlan::from_toml(value).map_err(|_| {
                 crate::PresetResolutionError::InvalidConfig {
                     slug: "nixpacks".to_string(),
-                    reason: format!("failed to parse Nixpacks TOML: {}", error),
+                    reason: "failed to parse Nixpacks TOML; verify its syntax and supported fields"
+                        .to_string(),
                 }
             })?;
         }
@@ -174,8 +175,10 @@ impl NixpacksPreset {
 
     fn generate_plan_options(&self) -> Result<GeneratePlanOptions, String> {
         let mut plan = match self.config.nixpacks_config.as_deref() {
-            Some(config) => BuildPlan::from_toml(config)
-                .map_err(|error| format!("Failed to parse custom Nixpacks config: {}", error))?,
+            Some(config) => BuildPlan::from_toml(config).map_err(|_| {
+                "Failed to parse custom Nixpacks config; verify its syntax and supported fields"
+                    .to_string()
+            })?,
             None => BuildPlan::default(),
         };
 
@@ -541,8 +544,11 @@ impl NixpacksPreset {
             }
         }
 
-        debug!("Generated Dockerfile:\n{}", dockerfile);
-        debug!("Build args: {:?}", build_args);
+        debug!(
+            dockerfile_bytes = dockerfile.len(),
+            build_arg_count = build_args.len(),
+            "Generated Nixpacks Dockerfile"
+        );
         info!(
             "Successfully generated Dockerfile using nixpacks with {} build args",
             build_args.len()

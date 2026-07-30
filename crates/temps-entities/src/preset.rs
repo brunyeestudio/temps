@@ -813,10 +813,32 @@ pub struct LaravelConfig {
     pub build_command: Option<String>,
 }
 
+/// Catalog variant persisted under the canonical Dockerfile preset.
+///
+/// Existing rows predate this discriminator and therefore deserialize as
+/// [`DockerfileVariant::File`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerfileVariant {
+    #[default]
+    File,
+    Custom,
+}
+
+impl DockerfileVariant {
+    fn is_file(&self) -> bool {
+        *self == Self::File
+    }
+}
+
 /// Dockerfile preset configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DockerfileConfig {
+    /// Catalog variant. Omitted for the standard user-provided Dockerfile flow.
+    #[serde(default, skip_serializing_if = "DockerfileVariant::is_file")]
+    pub variant: DockerfileVariant,
+
     /// Path to Dockerfile (default: "Dockerfile")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dockerfile_path: Option<String>,
@@ -1199,6 +1221,20 @@ mod tests {
         );
         assert_eq!(NixpacksProvider::Static.nixpacks_name(), "staticfile");
         assert!(serde_json::from_str::<NixpacksProvider>("\"not-real\"").is_err());
+    }
+
+    #[test]
+    fn test_dockerfile_variant_is_backward_compatible_and_typed() {
+        let legacy: DockerfileConfig =
+            serde_json::from_value(serde_json::json!({ "dockerfilePath": "Dockerfile" })).unwrap();
+        assert_eq!(legacy.variant, DockerfileVariant::File);
+
+        let custom = DockerfileConfig {
+            variant: DockerfileVariant::Custom,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(custom).unwrap();
+        assert_eq!(json["variant"], "custom");
     }
 
     #[test]

@@ -4492,6 +4492,10 @@ export type DeploymentJobResponse = {
     execution_order?: number | null;
     finished_at?: number | null;
     id: number;
+    /**
+     * Internal workflow configuration is intentionally redacted. It can
+     * contain legacy plaintext secrets or encrypted secret envelopes.
+     */
     job_config?: unknown;
     job_id: string;
     job_type: string;
@@ -5306,7 +5310,16 @@ export type DockerfilePresetConfig = {
      * If not specified, defaults to "Dockerfile" in the build context
      */
     dockerfilePath?: string | null;
+    variant?: null | DockerfileVariant;
 };
+
+/**
+ * Catalog variant persisted under the canonical Dockerfile preset.
+ *
+ * Existing rows predate this discriminator and therefore deserialize as
+ * [`DockerfileVariant::File`].
+ */
+export type DockerfileVariant = 'file' | 'custom';
 
 /**
  * What to do with a domain during migration
@@ -5732,6 +5745,16 @@ export type EnableKvResponse = {
      * Whether the service was successfully enabled
      */
     success: boolean;
+};
+
+/**
+ * Response for the enable pg_stat_statements endpoint.
+ */
+export type EnablePgStatStatementsResponse = {
+    /**
+     * Human-readable message confirming the action.
+     */
+    message: string;
 };
 
 /**
@@ -14919,6 +14942,60 @@ export type SlackConfig = {
 };
 
 /**
+ * Response envelope for the slow-queries list endpoint.
+ */
+export type SlowQueriesResponse = {
+    /**
+     * Current page number (1-based).
+     */
+    page: number;
+    /**
+     * Number of rows per page used for this request.
+     */
+    page_size: number;
+    /**
+     * Ordered list of query stats, slowest first by total_exec_time_ms.
+     */
+    queries: Array<SlowQueryRow>;
+    /**
+     * Total number of qualifying rows across all pages.
+     */
+    total_count: number;
+};
+
+/**
+ * A single entry from `pg_stat_statements`, representing one normalized
+ * query fingerprint and its aggregate execution stats.
+ */
+export type SlowQueryRow = {
+    /**
+     * Shared block cache hit ratio (0.0–1.0).
+     * `None` when total block accesses are zero (e.g. function-only queries).
+     */
+    cache_hit_ratio?: number | null;
+    /**
+     * Number of times this query was executed.
+     */
+    calls: number;
+    /**
+     * Average wall-clock time per execution, in milliseconds.
+     */
+    mean_exec_time_ms: number;
+    /**
+     * Normalized query text (parameter literals replaced with `$N`).
+     */
+    query: string;
+    /**
+     * Total number of rows returned or affected.
+     */
+    rows: number;
+    /**
+     * Total wall-clock time spent executing this query, in milliseconds.
+     */
+    total_exec_time_ms: number;
+};
+
+/**
  * Smart filter presets for common funnel patterns
  */
 export type SmartFilter = {
@@ -15279,10 +15356,20 @@ export type SpanKind = 'UNSPECIFIED' | 'INTERNAL' | 'SERVER' | 'CLIENT' | 'PRODU
  * A single trace span ready for storage.
  */
 export type SpanRecord = {
+    /**
+     * Raw key/value pairs exactly as reported by the instrumenting library.
+     * Numeric values are NOT guaranteed to share `duration_ms`'s unit — they
+     * may be seconds, milliseconds, microseconds, or nanoseconds depending on
+     * the exporter's own convention, and the unit is not labeled here.
+     */
     attributes: {
         [key: string]: string;
     };
     deployment_id?: number | null;
+    /**
+     * Span duration in milliseconds. The only field on this struct guaranteed
+     * to be in milliseconds.
+     */
     duration_ms: number;
     end_time: string;
     events: Array<SpanEvent>;
@@ -27554,6 +27641,107 @@ export type GetPostgresWalHealthResponses = {
 };
 
 export type GetPostgresWalHealthResponse = GetPostgresWalHealthResponses[keyof GetPostgresWalHealthResponses];
+
+export type ExternalServiceEnablePgStatStatementsData = {
+    body?: never;
+    path: {
+        /**
+         * ID of the provisioned standalone Postgres service
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/pg-stat-statements/enable';
+};
+
+export type ExternalServiceEnablePgStatStatementsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:write)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not standalone Postgres (cluster or wrong type)
+     */
+    422: unknown;
+    /**
+     * Restart failed
+     */
+    500: unknown;
+};
+
+export type ExternalServiceEnablePgStatStatementsResponses = {
+    /**
+     * Container restarted; pg_stat_statements now active
+     */
+    200: EnablePgStatStatementsResponse;
+};
+
+export type ExternalServiceEnablePgStatStatementsResponse = ExternalServiceEnablePgStatStatementsResponses[keyof ExternalServiceEnablePgStatStatementsResponses];
+
+export type GetSlowQueriesData = {
+    body?: never;
+    path: {
+        /**
+         * ID of the provisioned Postgres service
+         */
+        service_id: number;
+    };
+    query?: {
+        /**
+         * Page number (1-based). Defaults to 1.
+         */
+        page?: number | null;
+        /**
+         * Number of rows per page (1–100). Defaults to 20.
+         */
+        page_size?: number | null;
+    };
+    url: '/external-services/{service_id}/pg-stat-statements/slow-queries';
+};
+
+export type GetSlowQueriesErrors = {
+    /**
+     * Invalid pagination parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:read)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not a Postgres service
+     */
+    422: unknown;
+    /**
+     * pg_stat_statements extension not available (container restart required)
+     */
+    503: unknown;
+};
+
+export type GetSlowQueriesResponses = {
+    /**
+     * Paginated slow queries from pg_stat_statements
+     */
+    200: SlowQueriesResponse;
+};
+
+export type GetSlowQueriesResponse = GetSlowQueriesResponses[keyof GetSlowQueriesResponses];
 
 export type ListRootContainersData = {
     body?: never;
@@ -42831,11 +43019,23 @@ export type GetProxyLogsData = {
          */
         visitor_id?: number | null;
         /**
-         * Start date for filtering (ISO 8601 format)
+         * Start date for filtering (ISO 8601 format).
+         *
+         * **Defaults to 1 hour before `end_date` (or before now) when omitted.**
+         * The listing is always time-bounded: an unbounded query would have to
+         * consider the entire retention window — 100M+ rows on a busy deployment —
+         * to return a single page. Pass an explicit `start_date` to widen the
+         * window, up to the configured retention horizon.
+         *
+         * The maximum span between `start_date` and `end_date` is 7 days when
+         * `project_id` is omitted, or 30 days when a single `project_id` is set —
+         * a project-scoped query is bounded by that project's own row count
+         * rather than the whole deployment's. A wider request is rejected with a
+         * 400 naming the applicable cap.
          */
         start_date?: string | null;
         /**
-         * End date for filtering (ISO 8601 format)
+         * End date for filtering (ISO 8601 format). Defaults to now.
          */
         end_date?: string | null;
         /**

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 
 mod docker;
 mod docker_compose;
+mod docker_custom;
 mod docusaurus;
 mod nextjs;
 mod nixpacks_preset;
@@ -28,10 +29,13 @@ pub mod providers;
 
 // Re-export Preset enum from temps-entities
 pub use temps_entities::preset::Preset as PresetType;
-use temps_entities::preset::{PresetConfig as StoredPresetConfig, NixpacksConfig};
+use temps_entities::preset::{
+    DockerfileVariant, NixpacksConfig, PresetConfig as StoredPresetConfig,
+};
 use build_system::BuildSystem;
 use docusaurus::Docusaurus;
 use docker::DockerfilePreset;
+use docker_custom::DockerCustomPreset;
 pub use nextjs::NextJs;
 pub use nixpacks_preset::{NixpacksPreset, NixpacksProvider};
 pub use react_app::CreateReactApp;
@@ -286,12 +290,7 @@ pub trait Preset: fmt::Display + Send + Sync {
             .ok_or_else(|| PresetResolutionError::NotPersistable { slug: self.slug() })?;
 
         if let Some(config) = config.as_ref() {
-            if config.preset_type() != preset {
-                return Err(PresetResolutionError::ConfigMismatch {
-                    config_preset: config.preset_type(),
-                    slug: self.slug(),
-                });
-            }
+            validate_preset_config(preset, config)?;
         }
 
         Ok(StoredPreset { preset, config })
@@ -327,6 +326,7 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         // Generic presets
         Box::new(docker_compose::DockerComposePreset),
         Box::new(DockerfilePreset),
+        Box::new(DockerCustomPreset),
         // Nixpacks auto-detect
         Box::new(NixpacksPreset::auto()),
         // Nixpacks provider-specific variants
@@ -363,20 +363,59 @@ pub fn resolve_preset_slug(
     preset.resolve_storage(config)
 }
 
+/// Validate typed configuration for its canonical stored preset.
+///
+/// This is intentionally public so create, full-update, and config-only patch
+/// paths share the same validation boundary.
+pub fn validate_preset_config(
+    preset: PresetType,
+    config: &StoredPresetConfig,
+) -> Result<(), PresetResolutionError> {
+    if config.preset_type() != preset {
+        return Err(PresetResolutionError::ConfigMismatch {
+            config_preset: config.preset_type(),
+            slug: preset.as_str().to_string(),
+        });
+    }
+
+    if let StoredPresetConfig::Nixpacks(config) = config {
+        NixpacksPreset::validate_config(config)?;
+    }
+
+    Ok(())
+}
+
 /// Instantiate the build preset for a canonical stored project configuration.
 pub fn get_preset_for_storage(
     preset: PresetType,
     config: Option<&StoredPresetConfig>,
 ) -> Result<Option<Box<dyn Preset>>, PresetResolutionError> {
+    if let Some(config) = config {
+        validate_preset_config(preset, config)?;
+    }
+
     if preset == PresetType::Nixpacks {
         let nixpacks_config = match config {
             Some(StoredPresetConfig::Nixpacks(config)) => config.clone(),
             _ => NixpacksConfig::default(),
         };
-        NixpacksPreset::validate_config(&nixpacks_config)?;
         return Ok(Some(Box::new(NixpacksPreset::from_config(
             nixpacks_config,
         ))));
+    }
+
+    if preset == PresetType::Dockerfile {
+        let is_custom = matches!(
+            config,
+            Some(StoredPresetConfig::Dockerfile(config))
+                if config.variant == DockerfileVariant::Custom
+        );
+        let runtime_preset: Box<dyn Preset> = if is_custom {
+            Box::new(DockerCustomPreset)
+        } else {
+            Box::new(DockerfilePreset)
+        };
+        return Ok(Some(runtime_preset));
     }
 
     Ok(all_presets()

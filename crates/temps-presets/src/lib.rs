@@ -15,8 +15,9 @@ mod mod_rs {
 pub use {
     all_presets, detect_all_presets_from_files, detect_node_framework, detect_preset_from_files,
     get_preset_by_slug, get_preset_for_storage, resolve_preset_slug, runtime_slug,
-    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework,
-    PackageManager, Preset, PresetConfig, PresetResolutionError, ProjectType, StoredPreset,
+    validate_preset_config, DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider,
+    NodeFramework, PackageManager, Preset, PresetConfig, PresetResolutionError, ProjectType,
+    StoredPreset,
 };
 
 #[cfg(test)]
@@ -399,6 +400,42 @@ mod tests {
                 "catalog/storage round-trip for {slug}"
             );
         }
+    }
+
+    #[test]
+    fn test_custom_catalog_variant_roundtrips_through_dockerfile_storage() {
+        use temps_entities::preset::{
+            DockerfileVariant, Preset as EntityPreset, PresetConfig as EntityPresetConfig,
+        };
+
+        let stored = resolve_preset_slug("custom", None).unwrap();
+        assert_eq!(stored.preset, EntityPreset::Dockerfile);
+        assert!(matches!(
+            stored.config.as_ref(),
+            Some(EntityPresetConfig::Dockerfile(config))
+                if config.variant == DockerfileVariant::Custom
+        ));
+
+        let restored = get_preset_for_storage(stored.preset, stored.config.as_ref())
+            .unwrap()
+            .expect("custom preset should restore");
+        assert_eq!(restored.slug(), "custom");
+
+        let switched = resolve_preset_slug("dockerfile", stored.config).unwrap();
+        assert!(matches!(
+            switched.config.as_ref(),
+            Some(EntityPresetConfig::Dockerfile(config))
+                if config.variant == DockerfileVariant::File
+        ));
+        let restored = get_preset_for_storage(switched.preset, switched.config.as_ref())
+            .unwrap()
+            .expect("standard Dockerfile preset should restore after switching from custom");
+        assert_eq!(restored.slug(), "dockerfile");
+
+        let legacy_dockerfile = get_preset_for_storage(EntityPreset::Dockerfile, None)
+            .unwrap()
+            .expect("legacy Dockerfile preset should restore");
+        assert_eq!(legacy_dockerfile.slug(), "dockerfile");
     }
 
     #[test]
