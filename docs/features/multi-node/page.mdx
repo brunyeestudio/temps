@@ -285,11 +285,18 @@ that goes unused is visible rather than silently skipped.
 
 ### Enabling cross-architecture builds
 
-Set `cross_architecture_builds` in the environment's deployment config (or the
-project's, which environments inherit and can override). It is **off by
-default**: cross-builds are emulated and substantially slower, and turning them
-on automatically would mean one node joining the cluster silently changed build
-behaviour for every deployment.
+Set `crossArchitectureBuilds` in the environment's deployment config (or the
+project's, which environments inherit and can override):
+
+```bash
+curl -X PATCH https://your-temps/api/projects/{id}/deployment-config \
+  -H 'Content-Type: application/json' \
+  -d '{"crossArchitectureBuilds": true}'
+```
+
+It is **off by default**: cross-builds are emulated and substantially slower,
+and turning them on automatically would mean one node joining the cluster
+silently changed build behaviour for every deployment.
 
 <Note>
 Cross-architecture builds run on the **control plane** through Docker's

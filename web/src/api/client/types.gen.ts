@@ -4275,6 +4275,27 @@ export type DeploymentConfig = {
      */
     cpuRequest?: number | null;
     /**
+     * Build one image per architecture the eligible nodes run.
+     *
+     * `None`/`false` (the default) builds exactly once, on the control
+     * plane's native platform — byte-for-byte the behaviour of a
+     * single-architecture cluster. When enabled and the nodes this
+     * deployment could land on span more than one architecture, the build
+     * job produces one image per architecture; the non-native ones go
+     * through the daemon's `platform` option, which requires QEMU binfmt
+     * handlers registered on the control plane.
+     *
+     * **Opt-in on purpose.** Cross-architecture builds are emulated and
+     * substantially slower, and deriving them from cluster topology would
+     * mean a single node joining silently changes build behaviour for every
+     * deployment in the cluster. It also keeps the decision on operator
+     * config rather than on a value each node reports about itself.
+     *
+     * `Option<bool>` so an environment inherits the project's setting
+     * (`None`) or overrides it, matching `automatic_deploy`.
+     */
+    crossArchitectureBuilds?: boolean | null;
+    /**
      * Port exposed by the container
      * If not specified, will be auto-detected from Docker image or default to 3000
      */
@@ -5295,6 +5316,24 @@ export type DnsZone = {
     status: string;
 };
 
+/**
+ * Configuration for Docker Compose deployments.
+ */
+export type DockerComposePresetConfig = {
+    /**
+     * User-provided docker-compose.override.yml content.
+     */
+    composeOverride?: string | null;
+    /**
+     * Path to the Compose file relative to the project directory.
+     */
+    composePath?: string | null;
+    /**
+     * Compose service ports that should be publicly routed.
+     */
+    publicPorts?: Array<ComposePublicPort>;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -5314,24 +5353,6 @@ export type DockerRegistrySettingsMasked = {
     registry_url?: string | null;
     tls_verify: boolean;
     username?: string | null;
-};
-
-/**
- * Configuration for Docker Compose deployments.
- */
-export type DockerComposePresetConfig = {
-    /**
-     * User-provided docker-compose.override.yml content.
-     */
-    composeOverride?: string | null;
-    /**
-     * Path to the Compose file relative to the project directory.
-     */
-    composePath?: string | null;
-    /**
-     * Compose service ports that should be publicly routed.
-     */
-    publicPorts?: Array<ComposePublicPort>;
 };
 
 /**
@@ -15062,7 +15083,9 @@ export type SlowQueryRow = {
      */
     calls: number;
     /**
-     * Name of the database this query ran against. `(dropped database)` when the originating database no longer exists but `pg_stat_statements` still holds stats for it.
+     * Name of the database this query ran against. `(dropped database)`
+     * when the originating database no longer exists but
+     * `pg_stat_statements` still holds stats for it.
      */
     database: string;
     /**
@@ -16766,6 +16789,13 @@ export type UpdateDeploymentConfigRequest = {
     automaticDeploy?: boolean | null;
     cpuLimit?: number | null;
     cpuRequest?: number | null;
+    /**
+     * Build one image per architecture the eligible nodes run. Off by
+     * default; environments inherit this and may override it. Cross-builds
+     * are emulated on the control plane and substantially slower, so they are
+     * opted into rather than triggered by cluster topology.
+     */
+    crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
     memoryLimit?: number | null;
     memoryRequest?: number | null;
@@ -16853,6 +16883,13 @@ export type UpdateEnvironmentSettingsRequest = {
      * Absent leaves the current value unchanged.
      */
     cpu_request?: number | null;
+    /**
+     * Build one image per architecture the eligible nodes run (overrides the
+     * project-level setting). Off by default: cross-architecture builds are
+     * emulated on the control plane and substantially slower, so they are
+     * opted into per environment rather than triggered by cluster topology.
+     */
+    cross_architecture_builds?: boolean | null;
     /**
      * Port exposed by the container (overrides project-level port for this environment)
      *
@@ -27363,7 +27400,7 @@ export type GetServiceEnvironmentVariableData = {
 
 export type GetServiceEnvironmentVariableErrors = {
     /**
-     * Access denied for encrypted variable
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -27839,7 +27876,10 @@ export type GetSlowQueriesData = {
          */
         page_size?: number | null;
         /**
-         * Column to sort by: one of `calls`, `total_exec_time_ms`, `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to `mean_exec_time_ms`. Applied server-side so ordering stays consistent across pages.
+         * Column to sort by: one of `calls`, `total_exec_time_ms`,
+         * `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+         * `mean_exec_time_ms`. Applied server-side so ordering stays
+         * consistent across pages.
          */
         sort_by?: string | null;
         /**
@@ -32172,6 +32212,10 @@ export type RevealNotificationProviderConfigErrors = {
      * Field is not revealable
      */
     400: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
     /**
      * Provider or field not found
      */
@@ -37921,7 +37965,7 @@ export type GetResolvedEnvironmentVariableValueData = {
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -37974,7 +38018,7 @@ export type GetEnvironmentVariableValueData = {
 
 export type GetEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -38830,6 +38874,10 @@ export type GetContainerEnvironmentVariableData = {
 };
 
 export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
     /**
      * Container or environment variable not found
      */
@@ -41262,6 +41310,10 @@ export type RevealMcpConfigErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
     /**
      * MCP server or field not found
      */
@@ -45511,6 +45563,10 @@ export type RevealGlobalMcpConfigErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
     /**
      * MCP server or field not found
      */
