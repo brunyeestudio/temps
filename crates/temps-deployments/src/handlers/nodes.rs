@@ -2618,6 +2618,11 @@ impl From<NodeError> for Problem {
             NodeError::NoCompatibleNode { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("No Compatible Node")
                 .with_detail(error.to_string()),
+            NodeError::InsufficientCompatibleNodes { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Insufficient Compatible Nodes")
+                    .with_detail(error.to_string())
+            }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)

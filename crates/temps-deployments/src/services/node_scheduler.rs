@@ -66,6 +66,71 @@ impl NodeAssignment {
     }
 }
 
+/// Why a node was dropped from the scheduling pool.
+///
+/// Carried out of the scheduler so the *deploy log* can say it — these used to
+/// be `tracing` lines only, which meant a user whose node was skipped saw
+/// nothing at all and had no way to tell a deliberate exclusion from a node
+/// that was simply never considered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExclusionReason {
+    /// The node runs an architecture no image was built for.
+    IncompatibleArchitecture {
+        node_platform: String,
+        image_platforms: Vec<String>,
+    },
+    /// The node never reported an architecture, so it was kept in the pool but
+    /// its compatibility could not be verified.
+    UnverifiedArchitecture,
+}
+
+impl std::fmt::Display for ExclusionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExclusionReason::IncompatibleArchitecture {
+                node_platform,
+                image_platforms,
+            } => write!(
+                f,
+                "runs {}, and this deployment only has images for [{}]",
+                node_platform,
+                image_platforms.join(", ")
+            ),
+            ExclusionReason::UnverifiedArchitecture => write!(
+                f,
+                "has not reported its architecture, so image compatibility could not be \
+                 verified — upgrade the node agent"
+            ),
+        }
+    }
+}
+
+/// A node the scheduler dropped (or kept but could not verify), with why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeExclusion {
+    pub node_id: i32,
+    pub node_name: String,
+    pub reason: ExclusionReason,
+    /// `false` for [`ExclusionReason::UnverifiedArchitecture`], where the node
+    /// stays schedulable and this is a warning rather than an exclusion.
+    pub excluded: bool,
+}
+
+impl std::fmt::Display for NodeExclusion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "'{}' {}", self.node_name, self.reason)
+    }
+}
+
+/// Result of a scheduling pass: where the replicas go, plus what was left out.
+#[derive(Debug, Clone)]
+pub struct SchedulingOutcome {
+    /// One entry per replica.
+    pub assignments: Vec<NodeAssignment>,
+    /// Nodes excluded or flagged, for the deploy log. Empty on the common path.
+    pub exclusions: Vec<NodeExclusion>,
+}
+
 /// Scheduling strategy for distributing replicas across nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SchedulingStrategy {
@@ -355,6 +420,7 @@ impl NodeScheduler {
             &[],
         )
         .await
+        .map(|outcome| outcome.assignments)
     }
 
     /// Like [`schedule_replicas`] but additionally accepts `exclude_node_ids` —
@@ -378,7 +444,7 @@ impl NodeScheduler {
         anti_affinity: bool,
         exclude_node_ids: &[i32],
         image_platforms: &[String],
-    ) -> Result<Vec<NodeAssignment>, NodeError> {
+    ) -> Result<SchedulingOutcome, NodeError> {
         let active_nodes = self
             .node_service
             .list_active(self.heartbeat_threshold_secs)
@@ -409,6 +475,9 @@ impl NodeScheduler {
         // `exec format error`. Drop it here so the failure is a scheduling
         // decision with a readable message instead of a crash loop.
         let local_compatible = self.local_supports(image_platforms);
+        // Collected rather than only logged: the caller writes these into the
+        // deploy log, which is the only place the user can see them.
+        let mut exclusions: Vec<NodeExclusion> = Vec::new();
         if !image_platforms.is_empty() {
             eligible_nodes.retain(|node| {
                 match node.architecture.as_deref() {
@@ -424,6 +493,15 @@ impl NodeScheduler {
                                 image_platforms = ?image_platforms,
                                 "Excluding node from scheduling: no image for its architecture"
                             );
+                            exclusions.push(NodeExclusion {
+                                node_id: node.id,
+                                node_name: node.name.clone(),
+                                reason: ExclusionReason::IncompatibleArchitecture {
+                                    node_platform: node_platform.to_string(),
+                                    image_platforms: image_platforms.to_vec(),
+                                },
+                                excluded: true,
+                            });
                         }
                         compatible
                     }
@@ -438,6 +516,13 @@ impl NodeScheduler {
                             "Node has not reported its architecture; assuming it is compatible. \
                              Upgrade the agent so the scheduler can verify this."
                         );
+                        exclusions.push(NodeExclusion {
+                            node_id: node.id,
+                            node_name: node.name.clone(),
+                            reason: ExclusionReason::UnverifiedArchitecture,
+                            // Kept in the pool — this is a warning, not a drop.
+                            excluded: false,
+                        });
                         true
                     }
                 }
@@ -461,7 +546,10 @@ impl NodeScheduler {
                     "No active target nodes found for deployment, falling back to local deployment"
                 );
             }
-            return Ok(vec![NodeAssignment::Local; replica_count as usize]);
+            return Ok(SchedulingOutcome {
+                assignments: vec![NodeAssignment::Local; replica_count as usize],
+                exclusions,
+            });
         }
 
         // Build the scheduling pool: Local (control plane) + remote worker nodes
@@ -485,6 +573,37 @@ impl NodeScheduler {
                 load_score: compute_load_score(&node.capacity),
             }))
             .collect();
+
+        // Anti-affinity means the user asked for one replica per node. When an
+        // architecture exclusion is what puts that out of reach, say so instead
+        // of silently stacking — reporting "3 replicas deployed" when two share
+        // a node defeats the point of asking for the spread.
+        //
+        // Deliberately gated on an exclusion having happened. A cluster that
+        // simply has fewer nodes than replicas keeps the long-standing,
+        // documented wrap-around: anti-affinity defaults to `true`, so failing
+        // there would break every multi-replica deployment on a single-node
+        // install.
+        //
+        // Measured against `full_pool` — nodes that *structurally* can run this
+        // image — before the load-threshold filter below. Load is transient and
+        // relaxing it is correct; an architecture mismatch is permanent.
+        let architecture_exclusions: Vec<&NodeExclusion> =
+            exclusions.iter().filter(|e| e.excluded).collect();
+        if anti_affinity
+            && !architecture_exclusions.is_empty()
+            && (full_pool.len() as u32) < replica_count
+        {
+            return Err(NodeError::InsufficientCompatibleNodes {
+                replicas: replica_count,
+                available: full_pool.len(),
+                excluded: architecture_exclusions
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            });
+        }
 
         // Filter out nodes that exceed the max load threshold.
         // Nodes without capacity data (load_score = None) are always eligible.
@@ -606,7 +725,10 @@ impl NodeScheduler {
             }
         };
 
-        Ok(assignments)
+        Ok(SchedulingOutcome {
+            assignments,
+            exclusions,
+        })
     }
 
     /// Get the assignment for a single replica (convenience wrapper).
@@ -885,7 +1007,8 @@ mod tests {
         let assignments = scheduler
             .schedule_replicas_excluding(3, None, None, false, &[], &["linux/amd64".to_string()])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
 
         assert_eq!(assignments.len(), 3);
         assert!(
@@ -907,7 +1030,8 @@ mod tests {
         let assignments = scheduler
             .schedule_replicas_excluding(2, None, None, false, &[], &["linux/arm64".to_string()])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
 
         assert_eq!(assignments.len(), 2);
         assert!(
@@ -943,9 +1067,144 @@ mod tests {
             }
             other => panic!(
                 "expected NoCompatibleNode, got {:?}",
-                other.map(|a| a.len())
+                other.map(|o| o.assignments.len())
             ),
         }
+    }
+
+    // ── Replica shortfall and exclusion reporting ────────────────────────
+
+    /// Anti-affinity asks for one replica per node. When an architecture
+    /// exclusion is what makes that impossible, fail with the number to set
+    /// instead of silently stacking two replicas on one node and reporting
+    /// "3 replicas deployed" — which is the opposite of what was asked for.
+    #[tokio::test]
+    async fn test_anti_affinity_shortfall_from_exclusion_is_an_error() {
+        // Local (amd64) + worker-amd can take 2 replicas; worker-arm is
+        // dropped because the image is amd64-only. 3 were requested.
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-amd", "linux/amd64"),
+                make_node_with_arch(2, "worker-arm", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+
+        let err = scheduler
+            .schedule_replicas_excluding(3, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap_err();
+
+        match err {
+            NodeError::InsufficientCompatibleNodes {
+                replicas,
+                available,
+                ref excluded,
+            } => {
+                assert_eq!(replicas, 3);
+                assert_eq!(available, 2, "Local + worker-amd");
+                // The message has to name the node and both platforms, or the
+                // operator can't tell why their replica count is unreachable.
+                assert!(excluded.contains("worker-arm"), "got: {excluded}");
+                assert!(excluded.contains("linux/arm64"), "got: {excluded}");
+            }
+            other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
+        }
+    }
+
+    /// A cluster that simply has fewer nodes than replicas keeps the
+    /// long-standing wrap-around. Anti-affinity defaults to ON, so failing
+    /// here would break every multi-replica deployment on a single-node
+    /// install — the exact regression the exclusion gate exists to avoid.
+    #[tokio::test]
+    async fn test_anti_affinity_without_exclusions_still_wraps_around() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(3, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .expect("nothing was excluded, so this must not fail");
+
+        assert_eq!(outcome.assignments.len(), 3);
+        assert!(outcome.exclusions.is_empty());
+    }
+
+    /// Stacking stays legal with anti-affinity off, even when an exclusion
+    /// shrinks the pool — that's the documented default and what every
+    /// single-node install relies on.
+    #[tokio::test]
+    async fn test_exclusion_shortfall_without_anti_affinity_still_stacks() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-amd", "linux/amd64"),
+                make_node_with_arch(2, "worker-arm", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(3, None, None, false, &[], &["linux/amd64".to_string()])
+            .await
+            .expect("anti-affinity is off, so stacking is fine");
+
+        assert_eq!(outcome.assignments.len(), 3);
+    }
+
+    /// The caller has to be able to say a node was passed over. These were
+    /// `tracing` lines only, which the person running the deploy never sees —
+    /// their node silently went unused with nothing to explain it.
+    #[tokio::test]
+    async fn test_excluded_nodes_are_reported_to_the_caller() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-amd", "linux/amd64"),
+                make_node_with_arch(2, "worker-arm", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(1, None, None, false, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exclusions.len(), 1);
+        let excluded = &outcome.exclusions[0];
+        assert_eq!(excluded.node_name, "worker-arm");
+        assert!(excluded.excluded);
+
+        // Rendered straight into the deploy log, so it must name the node and
+        // both sides of the mismatch.
+        let rendered = excluded.to_string();
+        assert!(rendered.contains("worker-arm"), "got: {rendered}");
+        assert!(rendered.contains("linux/arm64"), "got: {rendered}");
+        assert!(rendered.contains("linux/amd64"), "got: {rendered}");
+    }
+
+    /// A node that never reported an architecture stays schedulable, but the
+    /// caller is told — otherwise "kept but unverified" is indistinguishable
+    /// from "verified compatible".
+    #[tokio::test]
+    async fn test_unverified_node_is_flagged_but_not_excluded() {
+        let scheduler = scheduler_with_nodes(vec![make_node(1, "legacy-worker")], "linux/amd64");
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(1, None, None, false, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exclusions.len(), 1);
+        assert!(
+            !outcome.exclusions[0].excluded,
+            "an unverified node must stay in the pool"
+        );
+        assert_eq!(
+            outcome.exclusions[0].reason,
+            ExclusionReason::UnverifiedArchitecture
+        );
     }
 
     /// A node upgraded from a pre-multi-arch agent reports nothing. Excluding
@@ -957,7 +1216,8 @@ mod tests {
         let assignments = scheduler
             .schedule_replicas_excluding(4, None, None, false, &[], &["linux/amd64".to_string()])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
 
         assert!(
             assignments.iter().any(|a| !a.is_local()),
@@ -978,7 +1238,8 @@ mod tests {
         let assignments = scheduler
             .schedule_replicas_excluding(2, None, None, false, &[], &["linux/arm64".to_string()])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
 
         assert!(assignments.iter().all(|a| !a.is_local()));
     }
@@ -995,7 +1256,8 @@ mod tests {
         let assignments = scheduler
             .schedule_replicas_excluding(4, None, None, false, &[], &[])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
 
         assert_eq!(assignments.len(), 4);
         assert!(assignments.iter().any(|a| a.is_local()));
@@ -2197,7 +2459,8 @@ mod tests {
         let assignments = scheduler
             .schedule_replicas_excluding(2, None, None, true, &exclude, &[])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
         assert_eq!(assignments.len(), 2);
 
         // Should only use Local and worker-c (node 3)
@@ -2227,7 +2490,8 @@ mod tests {
         let assignments = scheduler
             .schedule_replicas_excluding(3, None, None, true, &exclude, &[])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
         assert_eq!(assignments.len(), 3);
 
         // Local is never excluded, so even with all remote excluded, we still
@@ -2252,7 +2516,8 @@ mod tests {
         let assignments = scheduler
             .schedule_replicas_excluding(6, None, None, false, &exclude, &[])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
         assert_eq!(assignments.len(), 6);
 
         // With anti-affinity disabled, excluded nodes should still be used

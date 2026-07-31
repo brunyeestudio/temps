@@ -534,7 +534,8 @@ async fn test_mixed_fleet_places_amd64_image_only_on_amd64_nodes() {
     let assignments = scheduler
         .schedule_replicas_excluding(6, None, None, false, &[], &["linux/amd64".to_string()])
         .await
-        .unwrap();
+        .unwrap()
+        .assignments;
 
     assert_eq!(assignments.len(), 6);
     for assignment in &assignments {

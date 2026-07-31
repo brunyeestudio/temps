@@ -1019,7 +1019,21 @@ impl DeployImageJob {
                 )
                 .await
             {
-                Ok(assignments) => {
+                Ok(outcome) => {
+                    // Say which nodes were passed over and why. The scheduler
+                    // only had `tracing` for this, which the user never sees —
+                    // a node they are paying for would silently not be used,
+                    // with nothing in the deploy log to explain it.
+                    for exclusion in &outcome.exclusions {
+                        let line = if exclusion.excluded {
+                            format!("Skipping node {}", exclusion)
+                        } else {
+                            format!("WARNING: node {}", exclusion)
+                        };
+                        self.log(context, line).await?;
+                    }
+
+                    let assignments = outcome.assignments;
                     // Log where replicas will be deployed
                     for (i, assignment) in assignments.iter().enumerate() {
                         match assignment {
@@ -1052,6 +1066,19 @@ impl DeployImageJob {
                 // error: falling back to Local would deploy the very container
                 // the scheduler just established cannot start here.
                 Err(e @ crate::services::node_service::NodeError::NoCompatibleNode { .. }) => {
+                    let msg = format!("Cannot schedule this deployment: {}", e);
+                    self.log(context, format!("ERROR: {}", msg)).await?;
+                    return Err(WorkflowError::JobExecutionFailed(msg));
+                }
+                // Anti-affinity can't be honoured because nodes were excluded.
+                // Also hard: degrading to Local here would stack every replica
+                // on one machine, which is the opposite of what was asked for,
+                // and reporting it as success would hide that.
+                Err(
+                    e @ crate::services::node_service::NodeError::InsufficientCompatibleNodes {
+                        ..
+                    },
+                ) => {
                     let msg = format!("Cannot schedule this deployment: {}", e);
                     self.log(context, format!("ERROR: {}", msg)).await?;
                     return Err(WorkflowError::JobExecutionFailed(msg));

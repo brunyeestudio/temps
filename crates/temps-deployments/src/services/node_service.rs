@@ -38,6 +38,20 @@ pub enum NodeError {
         local_platform: String,
     },
 
+    #[error(
+        "{replicas} replicas requested with anti-affinity, but only {available} node(s) \
+         can run this image ({excluded}). Set replicas to {available}, add a compatible \
+         node, or disable anti-affinity to stack replicas on the nodes you have"
+    )]
+    InsufficientCompatibleNodes {
+        /// Replicas the deployment asked for.
+        replicas: u32,
+        /// Nodes that can actually run the image.
+        available: usize,
+        /// What was dropped from the pool and why, already formatted.
+        excluded: String,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
