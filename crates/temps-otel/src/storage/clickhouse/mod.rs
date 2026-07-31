@@ -115,6 +115,18 @@ pub struct ClickHouseOtelClient {
     pub(crate) client: ::clickhouse::Client,
 }
 
+/// Wall-clock ceiling for any single ClickHouse query, in seconds.
+/// A Traces list query that takes two minutes is already a failure from the
+/// user's point of view; this makes it fail as one.
+const CH_MAX_EXECUTION_TIME_SECS: &str = "120";
+
+/// Memory ceiling for any single ClickHouse query, in bytes (8 GiB).
+const CH_MAX_MEMORY_USAGE_BYTES: &str = "8589934592";
+
+/// Start spilling `GROUP BY` state to disk at half the memory ceiling, so
+/// aggregations degrade to slow rather than failing outright.
+const CH_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY: &str = "4294967296";
+
 impl ClickHouseOtelClient {
     /// Build a client from configuration.
     ///
@@ -125,7 +137,27 @@ impl ClickHouseOtelClient {
             .with_url(config.url)
             .with_database(config.database)
             .with_user(config.user)
-            .with_password(config.password);
+            .with_password(config.password)
+            // Per-query blast radius. Without these, one authenticated read of
+            // a very large project (an unbounded `count_traces`, a wide window,
+            // a pathological offset) can hold many GB and many minutes on a
+            // ClickHouse instance every tenant on the node shares — the query
+            // fails either way, the question is whether it takes the server's
+            // other queries down with it. These bound it to a clean
+            // per-query MEMORY_LIMIT_EXCEEDED / TIMEOUT_EXCEEDED instead.
+            //
+            // Deliberately generous: a normal Traces page reads a window, not a
+            // table, so real usage is orders of magnitude under both. They are
+            // constants rather than settings because there is no operator
+            // demand for tuning them yet; if that appears, they belong on a
+            // settings row (CLAUDE.md forbids env-var config), not an env var.
+            .with_setting("max_execution_time", CH_MAX_EXECUTION_TIME_SECS)
+            .with_setting("max_memory_usage", CH_MAX_MEMORY_USAGE_BYTES)
+            // Spill GROUP BY state to disk rather than dying at the ceiling.
+            .with_setting(
+                "max_bytes_before_external_group_by",
+                CH_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY,
+            );
         Self { client }
     }
 
@@ -1361,15 +1393,31 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// and `error_count` have always counted only matching spans. Dropping the
     /// filter here would silently change those two numbers.
     ///
-    /// NO `FINAL`. `spans` is a ReplacingMergeTree, so a retried OTLP batch can
-    /// leave two physical rows for one `(project_id, trace_id, span_id)` until
-    /// the next merge. FINAL cost 932ms vs 122ms for the two-stage shape on a
-    /// 10M-span measure (0007 header), and it also disables projection use. The
-    /// aggregates below are duplicate-insensitive instead: `argMax`, `min` and
-    /// `max` are idempotent under duplication (retried rows are byte-identical
-    /// apart from `_version`), and the two counts use `uniqExact(span_id)`
-    /// rather than `count()`, which counts distinct spans however many physical
-    /// copies exist.
+    /// NO `FINAL` — but stage 2 still deduplicates explicitly, because dropping
+    /// FINAL outright would have been wrong.
+    ///
+    /// `spans` is a ReplacingMergeTree, so one `(project_id, trace_id, span_id)`
+    /// can have several physical rows until the next merge, and FINAL cost
+    /// 932ms vs 122ms on a 10M-span measure (0007 header) while also disabling
+    /// projection use. It is tempting to argue the aggregates are
+    /// duplicate-insensitive and leave it at that — that argument only holds
+    /// for OTLP exporter retries, which re-send byte-identical rows.
+    ///
+    /// It does NOT hold in general: `temps-cli`'s `ch_backfill_domains` is a
+    /// second writer into this table, copying Postgres `otel_spans` rows in
+    /// with `_version` set to the span's own `start_time` (deliberately lower
+    /// than a live row's ingest-time `_version`). A backfilled copy and a live
+    /// copy of the same span can therefore differ in `status_code`,
+    /// `attributes`, `duration_ms` and more. FINAL resolved that by keeping the
+    /// highest `_version`; nothing else would.
+    ///
+    /// So stage 2 reads through an `ORDER BY _version DESC LIMIT 1 BY
+    /// (trace_id, span_id)` subquery, which keeps exactly the row FINAL would
+    /// have kept. This is affordable precisely because stage 2 is already
+    /// narrowed to the page's <= `limit` traces (a few hundred rows), whereas
+    /// FINAL would have merged across every part of the scanned range.
+    /// With one row per span guaranteed, `count()` / `countIf()` are exact
+    /// again and `argMax` can no longer tie between divergent copies.
     ///
     /// `deployment_environment` is a denormalized LowCardinality column at
     /// ingest time; there is no CH→Postgres JOIN for environment names. The
@@ -1483,6 +1531,12 @@ impl OtelStorage for ClickHouseOtelStorage {
         // priority with a large addend so argMax always selects them when
         // present; otherwise falls back to the longest span (max duration).
         //
+        // The inner SELECT is the FINAL replacement (see the doc comment):
+        // `ORDER BY _version DESC LIMIT 1 BY (trace_id, span_id)` keeps exactly
+        // the row FINAL would have kept, over the few hundred rows belonging to
+        // this page's traces. Because that guarantees one row per span,
+        // `count()` and `countIf()` are exact and do not need `uniqExact`.
+        //
         // No HAVING: stage 1 already applied it, and stage 2 groups the same
         // spans over the same filter, so it would be a no-op.
         let sql = format!(
@@ -1502,10 +1556,17 @@ impl OtelStorage for ClickHouseOtelStorage {
                          ELSE duration_ms END) AS deployment_environment,
                 toUnixTimestamp64Milli(min(start_time)) AS start_time_ms,
                 max(duration_ms) AS max_duration_ms,
-                uniqExact(span_id) AS span_count,
-                uniqExactIf(span_id, status_code = 'ERROR') AS error_count
-            FROM spans
-            WHERE {where_sql} AND trace_id IN ({stage1_sql})
+                count() AS span_count,
+                countIf(status_code = 'ERROR') AS error_count
+            FROM (
+                SELECT trace_id, span_id, parent_span_id, name, service_name,
+                       kind, deployment_environment, start_time, duration_ms,
+                       status_code
+                FROM spans
+                WHERE {where_sql} AND trace_id IN ({stage1_sql})
+                ORDER BY _version DESC
+                LIMIT 1 BY (trace_id, span_id)
+            )
             GROUP BY trace_id
             {order_sql}"#
         );
@@ -1587,10 +1648,31 @@ impl OtelStorage for ClickHouseOtelStorage {
     ///   * Status filter → the per-trace GROUP BY + HAVING is unavoidable, so
     ///     keep the subquery form.
     ///
-    /// NO `FINAL` in either shape: `uniqExact(trace_id)` counts distinct trace
-    /// IDs, so duplicate physical rows left by a retried OTLP batch cannot
-    /// inflate it, and the HAVING is a `> 0` / `= 0` test that duplication
-    /// cannot flip.
+    /// NO `FINAL` in either shape:
+    ///
+    ///   * `uniqExact(trace_id)` counts DISTINCT trace IDs, so duplicate
+    ///     physical rows cannot inflate it no matter how they differ.
+    ///   * The status `HAVING` is a `> 0` / `= 0` test, which byte-identical
+    ///     duplicates (the OTLP-retry case) cannot flip either.
+    ///
+    /// KNOWN RESIDUAL, deliberately not fixed here. `query_trace_summaries`
+    /// explains how a `ch_backfill_domains` copy of a span can disagree with
+    /// the live copy about `status_code`. Where that happens, this `HAVING` —
+    /// and the identical one in the page's stage 1 — can call a trace errored
+    /// on the strength of a superseded row, while the page's stage 2 (which
+    /// does deduplicate) reports `error_count = 0` for it.
+    ///
+    /// Resolving it here would mean grouping by `(trace_id, span_id)` to pick
+    /// `argMax(status_code, _version)` first: one group per SPAN instead of per
+    /// trace, across the whole window, on the exact query this module was
+    /// rewritten to make cheap. That is the wrong trade. The divergence needs
+    /// the same span to have been ingested into BOTH Postgres and ClickHouse
+    /// with different content — spans are never dual-written (`self.inner`
+    /// handles logs/insights/quota, not spans), and a re-run of the backfill
+    /// re-inserts byte-identical rows because its `_version` is derived from
+    /// `start_time`. It is narrow, transient, and a merge resolves it. The
+    /// `status = OK` direction cannot misreport at all: `= 0` means no copy is
+    /// ERROR, so the winning copy is not either.
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
         enum Bv {
             I32(i32),
@@ -1655,10 +1737,11 @@ impl OtelStorage for ClickHouseOtelStorage {
             _ => "",
         };
 
-        // With a status filter, use a subquery so we can apply HAVING on
-        // per-trace aggregates and then count the filtered set. `count()` on
-        // the outer query is enough because the inner GROUP BY already yields
-        // one row per trace. Without one, skip the grouping entirely.
+        // With a status filter, resolve one status_code per span (the highest
+        // `_version`, i.e. what FINAL would have kept) before applying HAVING
+        // on per-trace aggregates, then count the filtered set. `count()` on
+        // the outer query is enough because the middle GROUP BY already yields
+        // one row per trace. Without a status filter, skip all of it.
         let sql = if having_sql.is_empty() {
             format!("SELECT uniqExact(trace_id) AS cnt FROM spans WHERE {where_sql}")
         } else {

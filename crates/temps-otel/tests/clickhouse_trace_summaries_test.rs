@@ -12,13 +12,17 @@
 //!      returns confidently wrong rows. That is why the central case sets
 //!      EVERY optional filter at once instead of testing them one at a time.
 //!
-//!   2. **Dedup without FINAL.** `spans` is a ReplacingMergeTree, so a retried
-//!      OTLP batch leaves two physical rows per span until the next merge.
-//!      FINAL used to hide that. `span_count`/`error_count` now use
-//!      `uniqExact(span_id)` instead of `count()` to stay correct, and
-//!      `count_traces` uses `uniqExact(trace_id)`. The dedup test below stops
-//!      merges so the duplicates are guaranteed to still be there when it
-//!      asserts — otherwise the test could pass by accident.
+//!   2. **Dedup without FINAL.** `spans` is a ReplacingMergeTree, so one span
+//!      can have several physical rows until the next merge. FINAL used to hide
+//!      that. Stage 2 now deduplicates explicitly with
+//!      `ORDER BY _version DESC LIMIT 1 BY (trace_id, span_id)` — the same row
+//!      FINAL would have kept — and `count_traces` relies on
+//!      `uniqExact(trace_id)` being duplicate-proof by construction.
+//!      Two tests cover this, and BOTH stop merges first so the duplicates are
+//!      guaranteed still present when they assert, rather than passing by
+//!      accident: one for identical copies (an OTLP retry) and one for
+//!      *divergent* copies (a Postgres backfill), where picking the wrong row
+//!      changes the answer rather than just the row count.
 //!
 //! A third, subtler one: stage 1 selects `trace_id` only, so the ORDER BY must
 //! be written as an aggregate expression rather than as a reference to the
@@ -49,6 +53,8 @@ const OTHER_PROJECT: i32 = 99;
 /// Owned exclusively by the duplicate-rows test, so its double insert cannot
 /// perturb any other test sharing the container.
 const DUP_PROJECT: i32 = 77;
+/// Owned exclusively by the divergent-duplicate test.
+const DIVERGENT_PROJECT: i32 = 88;
 
 const DB: &str = "trace_summaries_test";
 
@@ -651,4 +657,88 @@ async fn trace_summaries_counts_ignore_duplicate_rows_from_retried_batches() {
         .await
         .expect("count over duplicated rows");
     assert_eq!(total, 1, "uniqExact(trace_id) counts the trace once");
+}
+
+/// The case that makes `FINAL`'s removal non-trivial, and the reason stage 2
+/// deduplicates explicitly rather than leaning on "duplicates are identical".
+///
+/// `temps-cli`'s `ch_backfill_domains` copies Postgres `otel_spans` rows into
+/// this table with `_version` derived from the span's own `start_time`, which is
+/// LOWER than a live row's ingest-time `_version`. Such a copy can disagree with
+/// the live row about `status_code`, `name`, and more. `FINAL` resolved that by
+/// keeping the highest `_version`; duplicate-insensitive aggregates would not —
+/// they would blend the two, so a superseded ERROR would inflate `error_count`
+/// and flip the trace's status, and `argMax` would tie-break arbitrarily on the
+/// name.
+///
+/// Two rows for ONE span id, deliberately divergent, inserted raw so the
+/// `_version`s can be pinned. Merges are stopped, so both are still present.
+#[tokio::test]
+async fn trace_summaries_resolves_divergent_duplicates_by_version() {
+    let Some(h) = harness().await else {
+        return;
+    };
+
+    let insert = |name: &str, status: &str, version: u64| {
+        let sql = format!(
+            "INSERT INTO spans (project_id, deployment_id, service_name, service_version, \
+             deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
+             start_time, end_time, duration_ms, status_code, status_message, \
+             attributes, events, _version) \
+             SELECT {DIVERGENT_PROJECT}, 1, 'svc', '1.0.0', 'production', \
+             'ffff8888', 'f001', '', '{name}', 'SERVER', \
+             now() - INTERVAL 5 MINUTE, now() - INTERVAL 5 MINUTE + INTERVAL 100 MILLISECOND, \
+             100.0, '{status}', '', '{{}}', '[]', {version}"
+        );
+        h.probe.query(&sql).execute()
+    };
+
+    // The superseded copy: lower _version, claims ERROR, different name —
+    // exactly the shape a Postgres backfill produces.
+    insert("GET /api/superseded", "ERROR", 1_000)
+        .await
+        .expect("insert superseded copy");
+    // The live copy: higher _version, the truth.
+    insert("GET /api/live", "OK", 2_000)
+        .await
+        .expect("insert live copy");
+
+    #[derive(::clickhouse::Row, serde::Deserialize)]
+    struct Cnt {
+        cnt: u64,
+    }
+    let physical = h
+        .probe
+        .query("SELECT count() AS cnt FROM spans WHERE project_id = ?")
+        .bind(DIVERGENT_PROJECT)
+        .fetch_one::<Cnt>()
+        .await
+        .expect("probe physical row count");
+    assert_eq!(
+        physical.cnt, 2,
+        "both divergent copies must still be unmerged for this test to mean anything"
+    );
+
+    let summaries = h
+        .storage
+        .query_trace_summaries(last_hour(DIVERGENT_PROJECT))
+        .await
+        .expect("summaries over divergent duplicates");
+
+    assert_eq!(trace_ids(&summaries), vec!["ffff8888"]);
+    let s = &summaries[0];
+    assert_eq!(s.span_count, 1, "two physical rows are ONE span, not two");
+    assert_eq!(
+        s.error_count, 0,
+        "the superseded ERROR copy must not count — the winning row says OK"
+    );
+    assert_eq!(
+        s.status_code,
+        SpanStatusCode::Ok,
+        "trace status follows the winning copy"
+    );
+    assert_eq!(
+        s.root_span_name, "GET /api/live",
+        "argMax must not tie-break arbitrarily between divergent copies"
+    );
 }
