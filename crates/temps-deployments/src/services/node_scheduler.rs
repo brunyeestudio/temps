@@ -529,6 +529,43 @@ impl NodeScheduler {
             });
         }
 
+        // Anti-affinity asks for one replica per node. When an architecture
+        // exclusion is what puts that out of reach, say so instead of silently
+        // stacking — reporting "3 replicas deployed" when all three share a
+        // node defeats the point of asking for the spread.
+        //
+        // This has to run BEFORE the `eligible_nodes.is_empty()` fallback
+        // below: when the filter removes *every* remote node, that fallback
+        // returns `replica_count` Local assignments and the check would never
+        // be reached — which is exactly the case a mixed cluster hits first.
+        //
+        // Deliberately gated on an exclusion having happened. A cluster that
+        // simply has fewer nodes than replicas keeps the long-standing,
+        // documented wrap-around: anti-affinity defaults to `true`, so failing
+        // there would break every multi-replica deployment on a single-node
+        // install.
+        //
+        // Counted before the load-threshold filter further down: load is
+        // transient and relaxing it is correct; an architecture mismatch is
+        // permanent.
+        let architecture_exclusions: Vec<&NodeExclusion> =
+            exclusions.iter().filter(|e| e.excluded).collect();
+        let compatible_slots = usize::from(local_compatible) + eligible_nodes.len();
+        if anti_affinity
+            && !architecture_exclusions.is_empty()
+            && (compatible_slots as u32) < replica_count
+        {
+            return Err(NodeError::InsufficientCompatibleNodes {
+                replicas: replica_count,
+                available: compatible_slots,
+                excluded: architecture_exclusions
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            });
+        }
+
         if eligible_nodes.is_empty() {
             if !local_compatible {
                 // Nowhere to put this: the control plane can't run the image
@@ -573,37 +610,6 @@ impl NodeScheduler {
                 load_score: compute_load_score(&node.capacity),
             }))
             .collect();
-
-        // Anti-affinity means the user asked for one replica per node. When an
-        // architecture exclusion is what puts that out of reach, say so instead
-        // of silently stacking — reporting "3 replicas deployed" when two share
-        // a node defeats the point of asking for the spread.
-        //
-        // Deliberately gated on an exclusion having happened. A cluster that
-        // simply has fewer nodes than replicas keeps the long-standing,
-        // documented wrap-around: anti-affinity defaults to `true`, so failing
-        // there would break every multi-replica deployment on a single-node
-        // install.
-        //
-        // Measured against `full_pool` — nodes that *structurally* can run this
-        // image — before the load-threshold filter below. Load is transient and
-        // relaxing it is correct; an architecture mismatch is permanent.
-        let architecture_exclusions: Vec<&NodeExclusion> =
-            exclusions.iter().filter(|e| e.excluded).collect();
-        if anti_affinity
-            && !architecture_exclusions.is_empty()
-            && (full_pool.len() as u32) < replica_count
-        {
-            return Err(NodeError::InsufficientCompatibleNodes {
-                replicas: replica_count,
-                available: full_pool.len(),
-                excluded: architecture_exclusions
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            });
-        }
 
         // Filter out nodes that exceed the max load threshold.
         // Nodes without capacity data (load_score = None) are always eligible.
@@ -1107,6 +1113,40 @@ mod tests {
                 // operator can't tell why their replica count is unreachable.
                 assert!(excluded.contains("worker-arm"), "got: {excluded}");
                 assert!(excluded.contains("linux/arm64"), "got: {excluded}");
+            }
+            other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
+        }
+    }
+
+    /// The case that escaped the first implementation and was caught on a real
+    /// mixed cluster: when the filter removes *every* remote node, the
+    /// "no eligible nodes, fall back to Local" path returned `replica_count`
+    /// Local assignments before the shortfall check was ever reached. Three
+    /// replicas silently stacked on the control plane and the deploy reported
+    /// success.
+    #[tokio::test]
+    async fn test_shortfall_errors_when_every_remote_node_is_excluded() {
+        // The only worker is arm64; the image is amd64-only. After filtering,
+        // `eligible_nodes` is empty and Local is the sole compatible slot.
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            "linux/amd64",
+        );
+
+        let err = scheduler
+            .schedule_replicas_excluding(3, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap_err();
+
+        match err {
+            NodeError::InsufficientCompatibleNodes {
+                replicas,
+                available,
+                ref excluded,
+            } => {
+                assert_eq!(replicas, 3);
+                assert_eq!(available, 1, "only the control plane can run it");
+                assert!(excluded.contains("worker-arm"), "got: {excluded}");
             }
             other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
         }
