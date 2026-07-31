@@ -268,15 +268,28 @@ and the platform drives three things:
    exists for its architecture. A node that reports nothing (an agent older
    than this feature, or one that hasn't heartbeated since upgrading) is
    treated as compatible and logged as unverified.
-2. **Building** — when the eligible nodes for a deployment span more than one
-   architecture, the build job produces one image per architecture. The
+2. **Building** — *opt-in.* When enabled and the eligible nodes span more than
+   one architecture, the build job produces one image per architecture. The
    control plane's own platform keeps the plain tag (`myapp:latest`); the
    others are suffixed (`myapp:latest-arm64`). Each replica receives the image
-   built for the node it lands on.
+   built for the node it lands on. Off by default, in which case one native
+   image is built and nodes of other architectures are simply not scheduled
+   onto.
 3. **Transfer** — before an image is shipped to a node, its architecture is
    checked against the node's. A mismatch fails the deployment with an
    explicit message instead of starting a container that dies with
    `exec format error`.
+
+Nodes passed over for either reason are named in the deploy log, so a worker
+that goes unused is visible rather than silently skipped.
+
+### Enabling cross-architecture builds
+
+Set `cross_architecture_builds` in the environment's deployment config (or the
+project's, which environments inherit and can override). It is **off by
+default**: cross-builds are emulated and substantially slower, and turning them
+on automatically would mean one node joining the cluster silently changed build
+behaviour for every deployment.
 
 <Note>
 Cross-architecture builds run on the **control plane** through Docker's
@@ -287,11 +300,22 @@ them once with:
 docker run --privileged --rm tonistiigi/binfmt --install arm64
 ```
 
-Without them, a cross-build fails with a message pointing at this command.
-Emulated builds are substantially slower than native ones — if that matters,
-restrict the environment to nodes of a single architecture with target nodes or
-labels, or push a pre-built image instead.
+Without them the cross-build for that architecture fails with a message
+pointing at this command, that platform is dropped, and nodes running it are
+excluded from the deployment — the rest of the cluster still deploys normally.
 </Note>
+
+If emulated build times don't suit you, the alternatives are to restrict the
+environment to nodes of a single architecture with target nodes or labels, or
+to push a pre-built image.
+
+### Replica counts on a mixed cluster
+
+With anti-affinity on (the default), Temps places one replica per node. If an
+architecture exclusion leaves fewer usable nodes than the replica count, the
+deployment fails and names the number to set — rather than quietly stacking two
+replicas on one node and reporting success. Lower the replica count, add a
+compatible node, or disable anti-affinity to allow stacking.
 
 Managed services (Postgres, Redis, and other presets) are unaffected: the agent
 pulls those images on the node itself, so multi-arch manifests resolve to the
