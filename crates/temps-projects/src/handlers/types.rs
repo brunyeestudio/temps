@@ -437,6 +437,10 @@ impl ProjectResponse {
                     .clone()
                     .map(|c| c.container_exec_enabled)
                     .unwrap_or(false),
+                cross_architecture_builds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.cross_architecture_builds),
             },
         }
     }

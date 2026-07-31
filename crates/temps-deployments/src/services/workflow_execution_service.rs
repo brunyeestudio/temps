@@ -678,7 +678,34 @@ impl WorkflowExecutionService {
                 // the node selectors below are the same ones the scheduler will
                 // apply, so we never build for an architecture this deployment
                 // cannot land on.
-                if let Some(scheduler) = self.node_scheduler.get() {
+                //
+                // Off unless the operator asked for it. Cross-builds are
+                // emulated and slow, and deriving them from cluster topology
+                // would let one node joining change build behaviour for every
+                // deployment — including breaking builds outright on a control
+                // plane without the matching QEMU binfmt handlers. Environment
+                // setting wins, inheriting the project's when unset.
+                let cross_builds_enabled = environment
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.cross_architecture_builds)
+                    .or_else(|| {
+                        project
+                            .deployment_config
+                            .as_ref()
+                            .and_then(|c| c.cross_architecture_builds)
+                    })
+                    .unwrap_or(false);
+
+                if !cross_builds_enabled {
+                    debug!(
+                        deployment_id = db_job.deployment_id,
+                        "Cross-architecture builds disabled; building for the control plane's \
+                         platform only"
+                    );
+                }
+
+                if let (true, Some(scheduler)) = (cross_builds_enabled, self.node_scheduler.get()) {
                     let target_nodes = environment
                         .deployment_config
                         .as_ref()
