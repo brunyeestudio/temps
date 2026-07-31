@@ -350,34 +350,35 @@ async fn test_legacy_builder_platform_mismatch_is_caught() {
         .await
         .map(|info| info.platform);
     let _ = image_builder.remove_image(&tag).await;
-    let _ = image_builder.remove_image(&foreign_tag).await;
+
+    // Either way the deployment proceeds: the native image built fine, and a
+    // secondary platform failing must not take down every deployment in the
+    // cluster (an operator without QEMU installed would otherwise break all of
+    // them by joining one ARM worker).
+    assert!(
+        result.is_ok(),
+        "a mislabelled secondary platform must degrade, not fail the job: {:?}",
+        result.err()
+    );
 
     match foreign_platform {
-        // The daemon honoured the platform after all (a future Docker release
-        // could fix the legacy builder). Then the build legitimately succeeds
-        // and there is nothing to catch.
-        Ok(platform) if temps_deployer::platform::platforms_match(&platform, foreign) => {
+        // The daemon honoured the platform after all — a future Docker release
+        // could fix the legacy builder. Nothing to catch, and the tag stays.
+        Ok(platform) if temps_deployer::platform::platforms_match(&platform, foreign) => {}
+        // The expected case today: the tag held the wrong architecture, so the
+        // job dropped it rather than advertising a mislabelled image. It must
+        // also not be left behind in the image store, where someone could pick
+        // it up by hand.
+        Ok(platform) => {
             assert!(
-                result.is_ok(),
-                "the legacy builder honoured {foreign}, so the build should have succeeded"
+                image_builder.inspect_image(&foreign_tag).await.is_err(),
+                "the mislabelled {platform} image must not survive as {foreign_tag}"
             );
         }
-        // The expected case today: wrong architecture, and the job must have
-        // refused it rather than handing back a mislabelled image.
-        _ => {
-            let error = result
-                .expect_err("a mislabelled cross-build must fail the job")
-                .to_string();
-            assert!(
-                error.contains("BuildKit"),
-                "the error must point at BuildKit as the fix, got: {error}"
-            );
-            assert!(
-                error.contains(foreign),
-                "the error must name the requested platform, got: {error}"
-            );
-        }
+        Err(_) => {}
     }
+
+    let _ = image_builder.remove_image(&foreign_tag).await;
 }
 
 /// ARMv6 is the one advertised platform where the variant matters end to end.

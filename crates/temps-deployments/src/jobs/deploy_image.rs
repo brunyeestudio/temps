@@ -1269,12 +1269,14 @@ impl DeployImageJob {
             ));
         }
 
+        // No fraction here: the failure path above rolls back and returns, so
+        // this line can never report a partial deployment — printing "2/3"
+        // would only ever be a lie.
         self.log(
             context,
             format!(
-                "✅ Successfully deployed {}/{} replicas",
-                all_container_ids.len(),
-                self.config.replicas
+                "✅ Successfully deployed {} replica(s)",
+                all_container_ids.len()
             ),
         )
         .await?;

@@ -68,6 +68,16 @@ pub struct RegisterNodeRequest {
     pub prior_token_hash: Option<String>,
 }
 
+/// A node's container platform changed (or was reported for the first time).
+#[derive(Debug, Clone)]
+pub struct ArchitectureChange {
+    pub node_id: i32,
+    pub node_name: String,
+    /// `None` when the node had never reported a platform.
+    pub from: Option<String>,
+    pub to: String,
+}
+
 /// Request to update a node's heartbeat.
 #[derive(Debug, Clone)]
 pub struct HeartbeatRequest {
@@ -254,11 +264,18 @@ impl NodeService {
     }
 
     /// Update a node's heartbeat timestamp and capacity metrics.
+    /// Record a heartbeat.
+    ///
+    /// Returns the architecture transition when the node reported a platform
+    /// different from the stored one (`None` on the left the first time it
+    /// reports at all). The caller audits it: the field decides where images
+    /// are placed and is supplied by the node itself, so a change is a
+    /// security-relevant event, not just a log line.
     pub async fn heartbeat(
         &self,
         node_id: i32,
         request: HeartbeatRequest,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Option<ArchitectureChange>, NodeError> {
         let node = nodes::Entity::find_by_id(node_id)
             .one(self.db.as_ref())
             .await?
@@ -276,6 +293,7 @@ impl NodeService {
             active.labels = Set(labels);
         }
         // Same rule as registration: absent means "not reported", not "unset".
+        let mut architecture_change = None;
         if let Some(architecture) = request.architecture {
             if node.architecture.as_deref() != Some(architecture.as_str()) {
                 tracing::info!(
@@ -285,12 +303,18 @@ impl NodeService {
                     architecture = %architecture,
                     "Node container platform recorded"
                 );
+                architecture_change = Some(ArchitectureChange {
+                    node_id,
+                    node_name: node.name.clone(),
+                    from: node.architecture.clone(),
+                    to: architecture.clone(),
+                });
             }
             active.architecture = Set(Some(architecture));
         }
         active.update(self.db.as_ref()).await?;
 
-        Ok(())
+        Ok(architecture_change)
     }
 
     /// Get a node by its ID.

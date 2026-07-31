@@ -761,8 +761,29 @@ impl BuildImageJob {
                     let build_host_platform = self.image_builder.get_native_platform();
                     let message =
                         Self::describe_build_failure(platform.as_deref(), &build_host_platform, &e);
-                    self.log(context, format!("ERROR: {}", message)).await?;
-                    return Err(WorkflowError::JobExecutionFailed(message));
+
+                    // Only the primary build is fatal. A secondary platform
+                    // failing — most often because QEMU isn't installed for it
+                    // — must not take the whole cluster's deployments down: it
+                    // simply isn't in `image_tags_by_platform`, so the
+                    // scheduler's architecture filter excludes those nodes and
+                    // the deployment proceeds on the rest (or fails with a
+                    // clean `NoCompatibleNode` if there is no rest).
+                    if index == 0 {
+                        self.log(context, format!("ERROR: {}", message)).await?;
+                        return Err(WorkflowError::JobExecutionFailed(message));
+                    }
+
+                    self.log(
+                        context,
+                        format!(
+                            "WARNING: {} Nodes running {} will be excluded from this deployment.",
+                            message,
+                            platform.as_deref().unwrap_or("that platform")
+                        ),
+                    )
+                    .await?;
+                    continue;
                 }
             };
 
@@ -789,12 +810,47 @@ impl BuildImageJob {
             .await?;
 
             if let Some(platform) = platform {
-                self.verify_built_platform(&build_result.image_name, platform, context)
-                    .await?;
-                image_tags_by_platform.insert(
-                    temps_deployer::platform::canonicalize_platform(platform),
-                    build_result.image_name.clone(),
-                );
+                // Same rule: a mislabelled secondary image drops its platform
+                // rather than failing every deployment in the cluster.
+                match self
+                    .verify_built_platform(&build_result.image_name, platform, context)
+                    .await
+                {
+                    Ok(()) => {
+                        image_tags_by_platform.insert(
+                            temps_deployer::platform::canonicalize_platform(platform),
+                            build_result.image_name.clone(),
+                        );
+                    }
+                    Err(e) if index > 0 => {
+                        // The tag exists but holds the wrong architecture.
+                        // Leaving it behind would let a mislabelled image be
+                        // picked up by hand later, so drop it — best-effort,
+                        // since failing here would defeat the degradation.
+                        if let Err(remove_err) = self
+                            .image_builder
+                            .remove_image(&build_result.image_name)
+                            .await
+                        {
+                            tracing::debug!(
+                                image = %build_result.image_name,
+                                "Could not remove the mislabelled image: {}",
+                                remove_err
+                            );
+                        }
+                        self.log(
+                            context,
+                            format!(
+                                "WARNING: {} Nodes running {} will be excluded from this \
+                                 deployment.",
+                                e, platform
+                            ),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
 
             if index == 0 {
@@ -1504,11 +1560,16 @@ mod tests {
         );
     }
 
-    /// A failed cross-build must not leave a half-built deployment looking
-    /// successful: the job fails, and the message points at the missing
-    /// emulation rather than at the Dockerfile.
+    /// A secondary platform failing must NOT fail the deployment.
+    ///
+    /// `required_build_platforms` is driven by cluster topology, so an
+    /// operator who joins an arm64 worker without installing QEMU would
+    /// otherwise break every deployment in the cluster — strictly worse than
+    /// the broken ARM replicas they had before. The platform drops out of
+    /// `image_tags_by_platform` instead, and the scheduler's architecture
+    /// filter excludes those nodes.
     #[tokio::test]
-    async fn test_cross_build_failure_fails_the_job_with_a_hint() {
+    async fn test_secondary_platform_failure_degrades_instead_of_aborting() {
         let builder = Arc::new(RecordingImageBuilder {
             builds: Default::default(),
             fail_platform: Some(("linux/arm64".to_string(), "exec format error".to_string())),
@@ -1524,14 +1585,46 @@ mod tests {
         let (_dir, repo) = repo_with_dockerfile();
         let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
 
-        let err = job.build_image(&repo, &context).await.unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("tonistiigi/binfmt"),
-            "operator needs the fix command, got: {}",
-            message
+        let output = job
+            .build_image(&repo, &context)
+            .await
+            .expect("the native build succeeded, so the deployment must proceed");
+
+        // The native image is there and usable...
+        assert_eq!(output.image_tag, "myapp:latest");
+        assert_eq!(
+            output.image_tags_by_platform.get("linux/amd64").unwrap(),
+            "myapp:latest"
         );
-        assert!(message.contains("linux/arm64"), "got: {}", message);
+        // ...and the platform that failed is absent, which is what makes the
+        // scheduler exclude arm64 nodes rather than send them a broken image.
+        assert!(
+            !output.image_tags_by_platform.contains_key("linux/arm64"),
+            "a failed platform must not be advertised: {:?}",
+            output.image_tags_by_platform
+        );
+    }
+
+    /// The primary build is still fatal — without it there is nothing to
+    /// deploy anywhere.
+    #[tokio::test]
+    async fn test_primary_platform_failure_still_fails_the_job() {
+        let builder = Arc::new(RecordingImageBuilder {
+            builds: Default::default(),
+            fail_platform: Some(("linux/amd64".to_string(), "boom".to_string())),
+        });
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .target_platforms(vec!["linux/amd64".to_string(), "linux/arm64".to_string()])
+            .build(builder.clone())
+            .unwrap();
+
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        assert!(job.build_image(&repo, &context).await.is_err());
     }
 
     #[test]

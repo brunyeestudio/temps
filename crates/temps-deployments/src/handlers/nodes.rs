@@ -22,11 +22,13 @@ use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::handlers::audit::NodeArchitectureChangedAudit;
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
 };
 use temps_core::problemdetails::{self, Problem};
+use temps_core::AuditContext;
 use temps_core::{AppSettings, PublicHostnameStrategy};
 use temps_deployer::ContainerDeployer;
 
@@ -46,6 +48,9 @@ pub struct NodeAppState {
     /// Notification pipeline — used to alert operators when a node recovers
     /// (offline->active on heartbeat). Optional: absent if no provider is wired.
     pub notification_service: Option<Arc<dyn temps_core::notifications::NotificationService>>,
+    /// Audit trail. A node's reported architecture decides where images are
+    /// placed, so a change to it is recorded like any other write.
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 /// Fixed-window rate limiter for the public node-registration endpoint
@@ -1172,11 +1177,36 @@ async fn node_heartbeat(
         architecture: normalize_reported_platform(request.architecture.as_deref()),
     };
 
-    app_state
+    let architecture_change = app_state
         .node_service
         .heartbeat(node_id, heartbeat)
         .await
         .map_err(Problem::from)?;
+
+    // The architecture decides where images are placed and is supplied by the
+    // node itself, so a change is an event an operator may need to explain
+    // later — a repointed daemon, or something impersonating the node. The
+    // heartbeat is unauthenticated in the user sense (a node token, not a
+    // session), hence no user context.
+    if let Some(change) = architecture_change {
+        let audit = NodeArchitectureChangedAudit {
+            context: AuditContext {
+                // No user: this is a node authenticating with its own token,
+                // not a session. `0` is the codebase's convention for an
+                // actor that isn't a user (see the failed-login audit).
+                user_id: 0,
+                ip_address: None,
+                user_agent: format!("temps-agent/node-{}", change.node_id),
+            },
+            node_id: change.node_id,
+            node_name: change.node_name,
+            from: change.from,
+            to: change.to,
+        };
+        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log: {}", e);
+        }
+    }
 
     // The node just came back: it was offline and this heartbeat flipped it to
     // active. Alert operators (recovery counterpart to the node-offline alert).
@@ -1716,7 +1746,12 @@ fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
         // advertise the platform its own Docker daemon runs — otherwise the
         // console shows every worker's architecture but a blank for the one
         // machine that builds the images.
-        architecture: Some(app_state.image_builder.get_native_platform()),
+        //
+        // Only the *confirmed* platform: `get_native_platform()` falls back to
+        // this binary's architecture, which would show the wrong value to the
+        // one person debugging a mixed cluster. The UI renders `None` as
+        // "Unknown", which is the honest answer until the daemon answers.
+        architecture: app_state.image_builder.discovered_platform(),
         last_heartbeat,
         created_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -2699,6 +2734,7 @@ mod tests {
                 test_db_for_enrollment,
             )),
             notification_service: None,
+            audit_service: Arc::new(RecordingAuditLogger::default()),
         });
         // The production router is served with connect info; tests use `oneshot`
         // (no peer address), so inject a mock so the `ConnectInfo` extractor
@@ -2716,6 +2752,57 @@ mod tests {
     }
 
     // ── Agent-reported platform sanitization ────────────────────────────
+
+    /// Captures audit operations so tests can assert one was written.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        operations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    /// A node's architecture decides where images are placed and is supplied
+    /// by the node itself, so a change to it is auditable — a repointed daemon
+    /// looks identical to something impersonating the node.
+    #[test]
+    fn test_architecture_change_is_an_auditable_operation() {
+        use temps_core::audit::AuditOperation;
+
+        let audit = NodeArchitectureChangedAudit {
+            context: AuditContext {
+                user_id: 0,
+                ip_address: None,
+                user_agent: "temps-agent/node-7".to_string(),
+            },
+            node_id: 7,
+            node_name: "worker-arm".to_string(),
+            from: Some("linux/amd64".to_string()),
+            to: "linux/arm64".to_string(),
+        };
+
+        assert_eq!(
+            audit.operation_type(),
+            "NODE_ARCHITECTURE_CHANGED".to_string()
+        );
+        let serialized = AuditOperation::serialize(&audit).expect("serializes");
+        // Both sides of the transition have to be in the record, or it can't
+        // answer "what changed" months later.
+        assert!(serialized.contains("linux/amd64"), "got: {serialized}");
+        assert!(serialized.contains("linux/arm64"), "got: {serialized}");
+        assert!(serialized.contains("worker-arm"), "got: {serialized}");
+    }
 
     #[test]
     fn test_normalize_reported_platform_canonicalizes_spellings() {
