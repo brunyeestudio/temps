@@ -27,7 +27,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ScrollText, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { DateRange } from 'react-day-picker'
-import { Navigate } from 'react-router-dom'
+import { Navigate } from 'react-router'
 
 const ITEMS_PER_PAGE = 20
 
