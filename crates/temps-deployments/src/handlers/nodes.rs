@@ -1147,6 +1147,12 @@ async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, 
 async fn node_heartbeat(
     State(app_state): State<Arc<NodeAppState>>,
     headers: HeaderMap,
+    // Same source as `register_node`: the router is served with
+    // `into_make_service_with_connect_info`, so the peer address is always
+    // present in production and injected by `MockConnectInfo` in tests. Needed
+    // for the architecture-change audit — without it, an operator repointing a
+    // daemon and something impersonating the node produce identical records.
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(node_id): Path<i32>,
     Json(request): Json<HeartbeatApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -1195,7 +1201,11 @@ async fn node_heartbeat(
                 // not a session. `0` is the codebase's convention for an
                 // actor that isn't a user (see the failed-login audit).
                 user_id: 0,
-                ip_address: None,
+                // The peer that sent the heartbeat. This is the field that
+                // separates "an operator repointed this node's daemon" from
+                // "something else is reporting as this node" — the reason the
+                // change is audited at all.
+                ip_address: Some(addr.ip().to_string()),
                 user_agent: format!("temps-agent/node-{}", change.node_id),
             },
             node_id: change.node_id,
@@ -2788,7 +2798,7 @@ mod tests {
         let audit = NodeArchitectureChangedAudit {
             context: AuditContext {
                 user_id: 0,
-                ip_address: None,
+                ip_address: Some("10.100.0.7".to_string()),
                 user_agent: "temps-agent/node-7".to_string(),
             },
             node_id: 7,
@@ -2807,6 +2817,12 @@ mod tests {
         assert!(serialized.contains("linux/amd64"), "got: {serialized}");
         assert!(serialized.contains("linux/arm64"), "got: {serialized}");
         assert!(serialized.contains("worker-arm"), "got: {serialized}");
+        // The peer address is what distinguishes an operator repointing the
+        // daemon from something else reporting as this node.
+        assert!(
+            serialized.contains("10.100.0.7"),
+            "the peer address must be recorded: {serialized}"
+        );
     }
 
     #[test]
