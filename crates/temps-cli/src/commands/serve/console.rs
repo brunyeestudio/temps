@@ -2494,28 +2494,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("OTel plugin registered successfully; background tasks pending project discovery integration");
     }
 
-    // Safety net for containers stranded by crashes or older versions whose
-    // project rows have already been deleted. The deployment service verifies
-    // the project is genuinely absent before it mutates Docker and ignores
-    // young containers to avoid racing an in-flight deployment.
-    if let Some(orphan_cleanup_service) =
-        service_context.get_service::<temps_deployments::DeploymentService>()
-    {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
-            loop {
-                interval.tick().await;
-                if let Err(error) = orphan_cleanup_service
-                    .cleanup_orphaned_local_containers(chrono::Duration::minutes(10))
-                    .await
-                {
-                    tracing::error!(%error, "Local orphan container reconciliation failed");
-                }
-            }
-        });
-        debug!("Local orphan container reconciliation started (every 10 minutes)");
-    }
-
     // Multi-node: create NodeService, register node routes, and start health check
     let config_service_for_nodes = service_context.require_service::<temps_config::ConfigService>();
     let node_service = Arc::new(NodeService::new(db.clone()));

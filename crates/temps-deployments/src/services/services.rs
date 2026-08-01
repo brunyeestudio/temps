@@ -1,7 +1,7 @@
 use futures::Stream;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    Set,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -110,152 +110,6 @@ pub struct DeploymentService {
 }
 
 impl DeploymentService {
-    /// Remove old, Temps-managed local containers whose labelled project no
-    /// longer exists. Project lookup completes successfully before any Docker
-    /// mutation, so a transient database failure always fails closed.
-    pub async fn cleanup_orphaned_local_containers(
-        &self,
-        minimum_age: chrono::Duration,
-    ) -> Result<u64, DeploymentError> {
-        let cutoff = chrono::Utc::now() - minimum_age;
-        let candidates: Vec<(temps_deployer::ContainerInfo, i32, i32, i32)> = self
-            .deployer
-            .list_containers()
-            .await
-            .map_err(|error| {
-                DeploymentError::Other(format!(
-                    "Failed to list local containers for orphan reconciliation: {error}"
-                ))
-            })?
-            .into_iter()
-            .filter_map(|container| {
-                let managed = container
-                    .labels
-                    .get("sh.temps.managed")
-                    .is_some_and(|value| value == "true");
-                let project_id = container
-                    .labels
-                    .get("sh.temps.project_id")
-                    .and_then(|value| value.parse::<i32>().ok());
-                let environment_id = container
-                    .labels
-                    .get("sh.temps.environment")
-                    .and_then(|value| value.parse::<i32>().ok());
-                let deployment_id = container
-                    .labels
-                    .get("sh.temps.deploy_id")
-                    .and_then(|value| value.parse::<i32>().ok());
-                (managed && container.created_at <= cutoff)
-                    .then_some(project_id.zip(environment_id).zip(deployment_id))
-                    .flatten()
-                    .map(|((project_id, environment_id), deployment_id)| {
-                        (container, project_id, environment_id, deployment_id)
-                    })
-            })
-            .collect();
-
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-
-        let project_ids: Vec<i32> = candidates
-            .iter()
-            .map(|(_, project_id, _, _)| *project_id)
-            .collect();
-        let environment_ids: Vec<i32> = candidates
-            .iter()
-            .map(|(_, _, environment_id, _)| *environment_id)
-            .collect();
-        let deployment_ids: Vec<i32> = candidates
-            .iter()
-            .map(|(_, _, _, deployment_id)| *deployment_id)
-            .collect();
-        let active_project_ids: std::collections::HashSet<i32> = projects::Entity::find()
-            .select_only()
-            .column(projects::Column::Id)
-            .filter(projects::Column::Id.is_in(project_ids))
-            .filter(projects::Column::IsDeleted.eq(false))
-            .into_tuple::<i32>()
-            .all(self.db.as_ref())
-            .await?
-            .into_iter()
-            .collect();
-        let active_environment_ids: std::collections::HashSet<i32> = environments::Entity::find()
-            .select_only()
-            .column(environments::Column::Id)
-            .filter(environments::Column::Id.is_in(environment_ids))
-            .filter(environments::Column::DeletedAt.is_null())
-            .into_tuple::<i32>()
-            .all(self.db.as_ref())
-            .await?
-            .into_iter()
-            .collect();
-        let existing_deployments = deployments::Entity::find()
-            .filter(deployments::Column::Id.is_in(deployment_ids))
-            .all(self.db.as_ref())
-            .await?;
-        let valid_owner_tuples: std::collections::HashSet<(i32, i32, i32)> = existing_deployments
-            .into_iter()
-            .filter(|deployment| {
-                active_project_ids.contains(&deployment.project_id)
-                    && active_environment_ids.contains(&deployment.environment_id)
-            })
-            .map(|deployment| {
-                (
-                    deployment.project_id,
-                    deployment.environment_id,
-                    deployment.id,
-                )
-            })
-            .collect();
-
-        let mut removed = 0_u64;
-        let mut failures = Vec::new();
-        for (container, project_id, environment_id, deployment_id) in candidates {
-            if valid_owner_tuples.contains(&(project_id, environment_id, deployment_id)) {
-                continue;
-            }
-
-            match self
-                .deployer
-                .remove_container(&container.container_id)
-                .await
-            {
-                Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
-                    removed += 1;
-                    info!(
-                        project_id,
-                        environment_id,
-                        deployment_id,
-                        container_id = %container.container_id,
-                        container_name = %container.container_name,
-                        "Removed orphaned local application container"
-                    );
-                }
-                Err(error) => {
-                    error!(
-                        project_id,
-                        environment_id,
-                        deployment_id,
-                        container_id = %container.container_id,
-                        %error,
-                        "Failed to remove orphaned local application container"
-                    );
-                    failures.push(format!("{}: {error}", container.container_id));
-                }
-            }
-        }
-
-        if failures.is_empty() {
-            Ok(removed)
-        } else {
-            Err(DeploymentError::Other(format!(
-                "Removed {removed} orphaned local container(s), but failed to remove: {}",
-                failures.join(", ")
-            )))
-        }
-    }
-
     async fn cleanup_containers(
         &self,
         project_id: i32,
@@ -4117,7 +3971,7 @@ mod tests {
 
     use chrono::Utc;
     use mockall::mock;
-    use sea_orm::{ActiveModelTrait, DatabaseBackend, DbErr, EntityTrait, MockDatabase, Set};
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
     use std::sync::Arc;
     use temps_core::EncryptionService;
@@ -4677,118 +4531,6 @@ mod tests {
         assert!(finalized.deleted_at.is_some());
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn orphan_sweep_removes_only_old_containers_with_absent_projects(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if !database_integration_tests_available().await {
-            eprintln!("Docker unavailable; skipping orphan sweep integration test");
-            return Ok(());
-        }
-
-        let test_db = TestDatabase::with_migrations().await?;
-        let db = test_db.connection_arc();
-        let (project, environment, deployment, _container) = setup_test_deployment(&db).await?;
-        let container_info =
-            |container_id: &str,
-             project_id: i32,
-             environment_id: i32,
-             deployment_id: i32,
-             created_at| temps_deployer::ContainerInfo {
-                container_id: container_id.to_string(),
-                container_name: container_id.to_string(),
-                created_at,
-                labels: std::collections::HashMap::from([
-                    ("sh.temps.managed".to_string(), "true".to_string()),
-                    ("sh.temps.project_id".to_string(), project_id.to_string()),
-                    (
-                        "sh.temps.environment".to_string(),
-                        environment_id.to_string(),
-                    ),
-                    ("sh.temps.deploy_id".to_string(), deployment_id.to_string()),
-                ]),
-                ..Default::default()
-            };
-        let old = Utc::now() - chrono::Duration::hours(1);
-        let young = Utc::now() - chrono::Duration::minutes(1);
-
-        let mut deployer = MockContainerDeployer::new();
-        deployer
-            .expect_list_containers()
-            .times(1)
-            .return_once(move || {
-                Ok(vec![
-                    container_info(
-                        "existing-project",
-                        project.id,
-                        environment.id,
-                        deployment.id,
-                        old,
-                    ),
-                    container_info(
-                        "old-orphan",
-                        project.id + 1000,
-                        environment.id + 1000,
-                        deployment.id + 1000,
-                        old,
-                    ),
-                    container_info(
-                        "young-orphan",
-                        project.id + 2000,
-                        environment.id + 2000,
-                        deployment.id + 2000,
-                        young,
-                    ),
-                ])
-            });
-        deployer
-            .expect_remove_container()
-            .withf(|container_id| container_id == "old-orphan")
-            .times(1)
-            .returning(|_| Ok(()));
-        let service = create_cleanup_service_for_test(db, Arc::new(deployer));
-
-        let removed = service
-            .cleanup_orphaned_local_containers(chrono::Duration::minutes(10))
-            .await?;
-        assert_eq!(removed, 1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn orphan_sweep_database_failure_never_removes_containers() {
-        let old = Utc::now() - chrono::Duration::hours(1);
-        let candidate = temps_deployer::ContainerInfo {
-            container_id: "must-not-remove".to_string(),
-            container_name: "must-not-remove".to_string(),
-            created_at: old,
-            labels: std::collections::HashMap::from([
-                ("sh.temps.managed".to_string(), "true".to_string()),
-                ("sh.temps.project_id".to_string(), "42".to_string()),
-                ("sh.temps.environment".to_string(), "43".to_string()),
-                ("sh.temps.deploy_id".to_string(), "44".to_string()),
-            ]),
-            ..Default::default()
-        };
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_errors([DbErr::Custom("projects table unavailable".to_string())])
-                .into_connection(),
-        );
-        let mut deployer = MockContainerDeployer::new();
-        deployer
-            .expect_list_containers()
-            .times(1)
-            .return_once(move || Ok(vec![candidate]));
-        deployer.expect_remove_container().times(0);
-        let service = create_cleanup_service_for_test(db, Arc::new(deployer));
-
-        let result = service
-            .cleanup_orphaned_local_containers(chrono::Duration::minutes(10))
-            .await;
-        assert!(matches!(result, Err(DeploymentError::DatabaseError { .. })));
     }
 
     #[tokio::test]
