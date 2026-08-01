@@ -11325,7 +11325,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
- "x25519-dalek 2.0.1",
+ "x25519-dalek 3.0.0",
 ]
 
 [[package]]
@@ -11589,7 +11589,6 @@ dependencies = [
  "pingora-http",
  "pingora-openssl",
  "pingora-proxy",
- "rand 0.8.6",
  "reqwest 0.12.28",
  "rustls-pemfile",
  "sea-orm",
@@ -11606,7 +11605,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "url",
- "x25519-dalek 2.0.1",
+ "x25519-dalek 3.0.0",
 ]
 
 [[package]]
@@ -13161,14 +13160,13 @@ version = "0.1.0-beta.55"
 dependencies = [
  "base64 0.22.1",
  "defguard_wireguard_rs",
- "rand 0.8.6",
  "serde",
  "serde_json",
  "temps-core",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "x25519-dalek 2.0.1",
+ "x25519-dalek 3.0.0",
 ]
 
 [[package]]
