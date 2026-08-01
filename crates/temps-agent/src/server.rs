@@ -164,7 +164,7 @@ fn spawn_heartbeat_loop(
 
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         let mut consecutive_failures: u32 = 0;
-        let mut inventory_sent = false;
+        let mut inventory_sent_at: Option<std::time::Instant> = None;
 
         loop {
             interval.tick().await;
@@ -172,9 +172,12 @@ fn spawn_heartbeat_loop(
             let capacity = collect_capacity_metrics();
             let mut body = serde_json::json!({ "capacity": capacity, "labels": labels });
 
-            // On the first heartbeat (agent startup/reconnect), include a full
-            // container inventory so the control plane can reconcile stale state.
-            if !inventory_sent {
+            // Include a full inventory on startup and every ten minutes. Besides
+            // reconciling stale DB rows, this lets the control plane repair old
+            // rowless containers left by interrupted/deprecated delete paths.
+            let inventory_due = inventory_sent_at
+                .is_none_or(|sent_at| sent_at.elapsed() >= Duration::from_secs(10 * 60));
+            if inventory_due {
                 match container_deployer.list_containers().await {
                     Ok(containers) => {
                         // Only include temps-managed containers
@@ -232,7 +235,9 @@ fn spawn_heartbeat_loop(
                         }
                         consecutive_failures = 0;
                         succeeded = true;
-                        inventory_sent = true;
+                        if body.get("containers").is_some() {
+                            inventory_sent_at = Some(std::time::Instant::now());
+                        }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
                     }

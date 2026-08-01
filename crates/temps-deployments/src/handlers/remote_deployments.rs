@@ -376,6 +376,7 @@ pub async fn deploy_from_image(
 
     // 1. Verify project exists and has DockerImage source type
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -619,6 +620,7 @@ pub async fn deploy_from_static(
 
     // 1. Verify project exists and has StaticFiles source type
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -894,6 +896,7 @@ pub async fn deploy_from_image_upload(
 
     // 1. Verify project exists and has DockerImage source type
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -1286,6 +1289,7 @@ pub async fn upload_static_bundle(
 
     // 1. Verify project exists and has StaticFiles source type
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
