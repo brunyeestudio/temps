@@ -55,7 +55,7 @@ Step-by-step tutorials for each framework: [Next.js](/deploy/nextjs), [React](/d
 | **Vite** ([React](/deploy/react), [Vue](/deploy/vue), [Svelte](/deploy/svelte)) | `vite.config.ts` or `vite.config.js` | `npm run build` | Static |
 | **[Remix](/deploy/remix)** | `remix.config.js` or `remix.config.ts` | `npm run build` | 3000 |
 | **[Astro](/deploy/astro)** | `astro.config.mjs` or `astro.config.ts` | `npm run build` | Static or 4321 |
-| **[SvelteKit](/deploy/svelte)** | `svelte.config.js` | `npm run build` | 3000 |
+| **[SvelteKit](/deploy/svelte)** | `svelte.config.js` (`@sveltejs/adapter-node`, `start`: `node build/index.js`) | `npm run build` | 3000 |
 | **Nuxt** | `nuxt.config.ts` or `nuxt.config.js` | `npm run build` | 3000 |
 | **Express** | `package.json` with `express` dependency | `npm start` | 3000 |
 | **Fastify** | `package.json` with `fastify` dependency | `npm start` | 3000 |

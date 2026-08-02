@@ -8,14 +8,14 @@ export const metadata = {
 
 # Deploy a SvelteKit App
 
-This tutorial walks you through deploying a SvelteKit application on Temps. SvelteKit supports static, server-rendered, and hybrid output — all work on Temps. {{ className: 'lead' }}
+This tutorial walks you through deploying a SvelteKit application on Temps. Use the [Node adapter](https://svelte.dev/docs/kit/adapter-node) and a `start` script so Temps can build and run your app as a server container. {{ className: 'lead' }}
 
 ---
 
 ## What you will build {{ anchor: true, id: 'what-you-will-build' }}
 
 - A SvelteKit app deployed from a Git repository
-- SSR with the Node adapter or static prerendering
+- SSR via `@sveltejs/adapter-node` with a `start` script that runs `node build/index.js`
 - Automatic HTTPS and deployment on every push
 
 **Time required:** 10 minutes.
@@ -31,7 +31,7 @@ This tutorial walks you through deploying a SvelteKit application on Temps. Svel
 
 ### Install the Node adapter
 
-For SSR deployments, use the Node adapter:
+Temps runs SvelteKit as a Node server. Install and configure `@sveltejs/adapter-node`:
 
 ```bash
 npm install -D @sveltejs/adapter-node
@@ -49,16 +49,19 @@ export default {
 };
 ```
 
-For static sites, use `@sveltejs/adapter-static` instead.
+Other adapters (for example `@sveltejs/adapter-auto` or `@sveltejs/adapter-static`) are not supported for Temps server deployments. Use `@sveltejs/adapter-node`.
 
-### Verify your package.json
+### Add a start script
+
+Temps launches your app with `npm start` (or the equivalent for your package manager). Add a `start` script that runs the Node adapter output:
 
 ```json {{ title: 'package.json' }}
 {
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start": "node build/index.js"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.0",
@@ -68,6 +71,8 @@ For static sites, use `@sveltejs/adapter-static` instead.
   }
 }
 ```
+
+The default start command is `node build/index.js` — that is the entry point produced by `@sveltejs/adapter-node` after `vite build`.
 
 ### Add a health check
 
@@ -115,7 +120,7 @@ ENV NODE_ENV=production
 COPY --from=builder /app/build ./build
 COPY --from=builder /app/package.json .
 EXPOSE 3000
-CMD ["node", "build"]
+CMD ["node", "build/index.js"]
 ```
 
 ---

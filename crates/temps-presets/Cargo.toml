@@ -21,8 +21,8 @@ toml = "1.1"
 serde_yaml = "0.9"
 utoipa = { workspace = true, optional = true }
 
-# Nixpacks integration
-nixpacks = "1.41.0"
+# Nixpacks integration (internal fork)
+temps-nixpacks = { path = "../temps-nixpacks" }
 
 [features]
 openapi = ["utoipa"]

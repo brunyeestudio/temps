@@ -10,18 +10,13 @@
 
 use crate::{DockerfileConfig, DockerfileWithArgs, Preset, ProjectType};
 use async_trait::async_trait;
-use nixpacks::nixpacks::{
+use temps_nixpacks::nixpacks::{
     app::App,
-    builder::{
-        docker::{docker_image_builder::DockerImageBuilder, DockerBuilderOptions},
-        ImageBuilder,
-    },
+    builder::docker::{docker_image_builder::DockerImageBuilder, DockerBuilderOptions},
     environment::Environment,
-    logger::Logger,
     plan::{
         generator::{GeneratePlanOptions, NixpacksBuildPlanGenerator},
-        BuildPlan,
-        PlanGenerator,
+        BuildPlan, PlanGenerator,
     },
 };
 use std::collections::HashMap;
@@ -203,30 +198,30 @@ impl NixpacksPreset {
         app: &App,
         environment: &Environment,
     ) -> Result<BuildPlan, String> {
-        let providers: &[&dyn nixpacks::providers::Provider] = &[
-            &nixpacks::providers::node::NodeProvider {},
-            &nixpacks::providers::python::PythonProvider {},
-            &nixpacks::providers::rust::RustProvider {},
-            &nixpacks::providers::go::GolangProvider {},
-            &nixpacks::providers::java::JavaProvider {},
-            &nixpacks::providers::php::PhpProvider {},
-            &nixpacks::providers::ruby::RubyProvider {},
-            &nixpacks::providers::deno::DenoProvider {},
-            &nixpacks::providers::elixir::ElixirProvider {},
-            &nixpacks::providers::csharp::CSharpProvider {},
-            &nixpacks::providers::fsharp::FSharpProvider {},
-            &nixpacks::providers::dart::DartProvider {},
-            &nixpacks::providers::swift::SwiftProvider {},
-            &nixpacks::providers::zig::ZigProvider {},
-            &nixpacks::providers::scala::ScalaProvider {},
-            &nixpacks::providers::haskell::HaskellStackProvider {},
-            &nixpacks::providers::clojure::ClojureProvider {},
-            &nixpacks::providers::crystal::CrystalProvider {},
-            &nixpacks::providers::cobol::CobolProvider {},
-            &nixpacks::providers::gleam::GleamProvider {},
-            &nixpacks::providers::lunatic::LunaticProvider {},
-            &nixpacks::providers::scheme::HauntProvider {},
-            &nixpacks::providers::staticfile::StaticfileProvider {},
+        let providers: &[&dyn temps_nixpacks::providers::Provider] = &[
+            &temps_nixpacks::providers::node::NodeProvider {},
+            &temps_nixpacks::providers::python::PythonProvider {},
+            &temps_nixpacks::providers::rust::RustProvider {},
+            &temps_nixpacks::providers::go::GolangProvider {},
+            &temps_nixpacks::providers::java::JavaProvider {},
+            &temps_nixpacks::providers::php::PhpProvider {},
+            &temps_nixpacks::providers::ruby::RubyProvider {},
+            &temps_nixpacks::providers::deno::DenoProvider {},
+            &temps_nixpacks::providers::elixir::ElixirProvider {},
+            &temps_nixpacks::providers::csharp::CSharpProvider {},
+            &temps_nixpacks::providers::fsharp::FSharpProvider {},
+            &temps_nixpacks::providers::dart::DartProvider {},
+            &temps_nixpacks::providers::swift::SwiftProvider {},
+            &temps_nixpacks::providers::zig::ZigProvider {},
+            &temps_nixpacks::providers::scala::ScalaProvider {},
+            &temps_nixpacks::providers::haskell::HaskellStackProvider {},
+            &temps_nixpacks::providers::clojure::ClojureProvider {},
+            &temps_nixpacks::providers::crystal::CrystalProvider {},
+            &temps_nixpacks::providers::cobol::CobolProvider {},
+            &temps_nixpacks::providers::gleam::GleamProvider {},
+            &temps_nixpacks::providers::lunatic::LunaticProvider {},
+            &temps_nixpacks::providers::scheme::HauntProvider {},
+            &temps_nixpacks::providers::staticfile::StaticfileProvider {},
         ];
 
         let options = self.generate_plan_options()?;
@@ -255,94 +250,94 @@ impl NixpacksPreset {
         };
 
         // Check each provider (except Auto and Static)
-        let providers_to_check: Vec<(NixpacksProvider, &dyn nixpacks::providers::Provider)> = vec![
+        let providers_to_check: Vec<(NixpacksProvider, &dyn temps_nixpacks::providers::Provider)> = vec![
             (
                 NixpacksProvider::Node,
-                &nixpacks::providers::node::NodeProvider {},
+                &temps_nixpacks::providers::node::NodeProvider {},
             ),
             (
                 NixpacksProvider::Python,
-                &nixpacks::providers::python::PythonProvider {},
+                &temps_nixpacks::providers::python::PythonProvider {},
             ),
             (
                 NixpacksProvider::Rust,
-                &nixpacks::providers::rust::RustProvider {},
+                &temps_nixpacks::providers::rust::RustProvider {},
             ),
             (
                 NixpacksProvider::Go,
-                &nixpacks::providers::go::GolangProvider {},
+                &temps_nixpacks::providers::go::GolangProvider {},
             ),
             (
                 NixpacksProvider::Java,
-                &nixpacks::providers::java::JavaProvider {},
+                &temps_nixpacks::providers::java::JavaProvider {},
             ),
             (
                 NixpacksProvider::Php,
-                &nixpacks::providers::php::PhpProvider {},
+                &temps_nixpacks::providers::php::PhpProvider {},
             ),
             (
                 NixpacksProvider::Ruby,
-                &nixpacks::providers::ruby::RubyProvider {},
+                &temps_nixpacks::providers::ruby::RubyProvider {},
             ),
             (
                 NixpacksProvider::Deno,
-                &nixpacks::providers::deno::DenoProvider {},
+                &temps_nixpacks::providers::deno::DenoProvider {},
             ),
             (
                 NixpacksProvider::Elixir,
-                &nixpacks::providers::elixir::ElixirProvider {},
+                &temps_nixpacks::providers::elixir::ElixirProvider {},
             ),
             (
                 NixpacksProvider::CSharp,
-                &nixpacks::providers::csharp::CSharpProvider {},
+                &temps_nixpacks::providers::csharp::CSharpProvider {},
             ),
             (
                 NixpacksProvider::FSharp,
-                &nixpacks::providers::fsharp::FSharpProvider {},
+                &temps_nixpacks::providers::fsharp::FSharpProvider {},
             ),
             (
                 NixpacksProvider::Dart,
-                &nixpacks::providers::dart::DartProvider {},
+                &temps_nixpacks::providers::dart::DartProvider {},
             ),
             (
                 NixpacksProvider::Swift,
-                &nixpacks::providers::swift::SwiftProvider {},
+                &temps_nixpacks::providers::swift::SwiftProvider {},
             ),
             (
                 NixpacksProvider::Zig,
-                &nixpacks::providers::zig::ZigProvider {},
+                &temps_nixpacks::providers::zig::ZigProvider {},
             ),
             (
                 NixpacksProvider::Scala,
-                &nixpacks::providers::scala::ScalaProvider {},
+                &temps_nixpacks::providers::scala::ScalaProvider {},
             ),
             (
                 NixpacksProvider::Haskell,
-                &nixpacks::providers::haskell::HaskellStackProvider {},
+                &temps_nixpacks::providers::haskell::HaskellStackProvider {},
             ),
             (
                 NixpacksProvider::Clojure,
-                &nixpacks::providers::clojure::ClojureProvider {},
+                &temps_nixpacks::providers::clojure::ClojureProvider {},
             ),
             (
                 NixpacksProvider::Crystal,
-                &nixpacks::providers::crystal::CrystalProvider {},
+                &temps_nixpacks::providers::crystal::CrystalProvider {},
             ),
             (
                 NixpacksProvider::Cobol,
-                &nixpacks::providers::cobol::CobolProvider {},
+                &temps_nixpacks::providers::cobol::CobolProvider {},
             ),
             (
                 NixpacksProvider::Gleam,
-                &nixpacks::providers::gleam::GleamProvider {},
+                &temps_nixpacks::providers::gleam::GleamProvider {},
             ),
             (
                 NixpacksProvider::Lunatic,
-                &nixpacks::providers::lunatic::LunaticProvider {},
+                &temps_nixpacks::providers::lunatic::LunaticProvider {},
             ),
             (
                 NixpacksProvider::Scheme,
-                &nixpacks::providers::scheme::HauntProvider {},
+                &temps_nixpacks::providers::scheme::HauntProvider {},
             ),
         ];
 
@@ -414,30 +409,30 @@ impl NixpacksPreset {
             }
         };
 
-        let providers: &[&dyn nixpacks::providers::Provider] = &[
-            &nixpacks::providers::node::NodeProvider {},
-            &nixpacks::providers::python::PythonProvider {},
-            &nixpacks::providers::rust::RustProvider {},
-            &nixpacks::providers::go::GolangProvider {},
-            &nixpacks::providers::java::JavaProvider {},
-            &nixpacks::providers::php::PhpProvider {},
-            &nixpacks::providers::ruby::RubyProvider {},
-            &nixpacks::providers::deno::DenoProvider {},
-            &nixpacks::providers::elixir::ElixirProvider {},
-            &nixpacks::providers::csharp::CSharpProvider {},
-            &nixpacks::providers::fsharp::FSharpProvider {},
-            &nixpacks::providers::dart::DartProvider {},
-            &nixpacks::providers::swift::SwiftProvider {},
-            &nixpacks::providers::zig::ZigProvider {},
-            &nixpacks::providers::scala::ScalaProvider {},
-            &nixpacks::providers::haskell::HaskellStackProvider {},
-            &nixpacks::providers::clojure::ClojureProvider {},
-            &nixpacks::providers::crystal::CrystalProvider {},
-            &nixpacks::providers::cobol::CobolProvider {},
-            &nixpacks::providers::gleam::GleamProvider {},
-            &nixpacks::providers::lunatic::LunaticProvider {},
-            &nixpacks::providers::scheme::HauntProvider {},
-            &nixpacks::providers::staticfile::StaticfileProvider {},
+        let providers: &[&dyn temps_nixpacks::providers::Provider] = &[
+            &temps_nixpacks::providers::node::NodeProvider {},
+            &temps_nixpacks::providers::python::PythonProvider {},
+            &temps_nixpacks::providers::rust::RustProvider {},
+            &temps_nixpacks::providers::go::GolangProvider {},
+            &temps_nixpacks::providers::java::JavaProvider {},
+            &temps_nixpacks::providers::php::PhpProvider {},
+            &temps_nixpacks::providers::ruby::RubyProvider {},
+            &temps_nixpacks::providers::deno::DenoProvider {},
+            &temps_nixpacks::providers::elixir::ElixirProvider {},
+            &temps_nixpacks::providers::csharp::CSharpProvider {},
+            &temps_nixpacks::providers::fsharp::FSharpProvider {},
+            &temps_nixpacks::providers::dart::DartProvider {},
+            &temps_nixpacks::providers::swift::SwiftProvider {},
+            &temps_nixpacks::providers::zig::ZigProvider {},
+            &temps_nixpacks::providers::scala::ScalaProvider {},
+            &temps_nixpacks::providers::haskell::HaskellStackProvider {},
+            &temps_nixpacks::providers::clojure::ClojureProvider {},
+            &temps_nixpacks::providers::crystal::CrystalProvider {},
+            &temps_nixpacks::providers::cobol::CobolProvider {},
+            &temps_nixpacks::providers::gleam::GleamProvider {},
+            &temps_nixpacks::providers::lunatic::LunaticProvider {},
+            &temps_nixpacks::providers::scheme::HauntProvider {},
+            &temps_nixpacks::providers::staticfile::StaticfileProvider {},
         ];
 
         let mut generator =
@@ -464,14 +459,14 @@ impl NixpacksPreset {
         }
     }
 
-    /// Generate actual Dockerfile using nixpacks' DockerImageBuilder
+    /// Generate a Dockerfile using temps-nixpacks' DockerImageBuilder
     ///
     /// This function uses the nixpacks library to:
     /// 1. Detect the project language/framework
     /// 2. Generate an optimized build plan
-    /// 3. Use DockerImageBuilder to generate the actual Dockerfile
+    /// 3. Write the Dockerfile (and supporting files) under `.nixpacks/`
     /// 4. Extract build args from the plan's variables
-    /// 5. Read the generated Dockerfile from .nixpacks/Dockerfile
+    /// 5. Read the generated Dockerfile from `.nixpacks/Dockerfile`
     ///
     /// Returns both the Dockerfile content and the build args that should be passed to docker build.
     async fn generate_dockerfile_content(
@@ -514,20 +509,16 @@ impl NixpacksPreset {
         //     return Err("No start command could be found in the build plan".to_string());
         // }
 
-        // Use DockerImageBuilder to generate the actual Dockerfile
-        let builder = DockerImageBuilder::new(
-            Logger::new(),
-            DockerBuilderOptions {
-                out_dir: Some(path.to_string_lossy().to_string()),
-                ..Default::default()
-            },
-        );
+        // Use DockerImageBuilder to write the Dockerfile (Temps builds the image itself)
+        let builder = DockerImageBuilder::new(DockerBuilderOptions {
+            out_dir: Some(path.to_string_lossy().to_string()),
+            ..Default::default()
+        });
 
         // Generate Dockerfile at .nixpacks/Dockerfile
         builder
-            .create_image(path_str, &plan, &environment)
-            .await
-            .map_err(|e| format!("Failed to create nixpacks image: {}", e))?;
+            .write_dockerfile(&plan, &environment)
+            .map_err(|e| format!("Failed to generate nixpacks Dockerfile: {}", e))?;
 
         // Read the generated Dockerfile
         let nixpacks_dockerfile = path.join(".nixpacks").join("Dockerfile");
@@ -698,30 +689,30 @@ mod tests {
         let app = App::new(path_str).ok()?;
         let environment = Environment::from_envs(vec![]).ok()?;
 
-        let providers: &[&dyn nixpacks::providers::Provider] = &[
-            &nixpacks::providers::node::NodeProvider {},
-            &nixpacks::providers::python::PythonProvider {},
-            &nixpacks::providers::rust::RustProvider {},
-            &nixpacks::providers::go::GolangProvider {},
-            &nixpacks::providers::java::JavaProvider {},
-            &nixpacks::providers::php::PhpProvider {},
-            &nixpacks::providers::ruby::RubyProvider {},
-            &nixpacks::providers::deno::DenoProvider {},
-            &nixpacks::providers::elixir::ElixirProvider {},
-            &nixpacks::providers::csharp::CSharpProvider {},
-            &nixpacks::providers::fsharp::FSharpProvider {},
-            &nixpacks::providers::dart::DartProvider {},
-            &nixpacks::providers::swift::SwiftProvider {},
-            &nixpacks::providers::zig::ZigProvider {},
-            &nixpacks::providers::scala::ScalaProvider {},
-            &nixpacks::providers::haskell::HaskellStackProvider {},
-            &nixpacks::providers::clojure::ClojureProvider {},
-            &nixpacks::providers::crystal::CrystalProvider {},
-            &nixpacks::providers::cobol::CobolProvider {},
-            &nixpacks::providers::gleam::GleamProvider {},
-            &nixpacks::providers::lunatic::LunaticProvider {},
-            &nixpacks::providers::scheme::HauntProvider {},
-            &nixpacks::providers::staticfile::StaticfileProvider {},
+        let providers: &[&dyn temps_nixpacks::providers::Provider] = &[
+            &temps_nixpacks::providers::node::NodeProvider {},
+            &temps_nixpacks::providers::python::PythonProvider {},
+            &temps_nixpacks::providers::rust::RustProvider {},
+            &temps_nixpacks::providers::go::GolangProvider {},
+            &temps_nixpacks::providers::java::JavaProvider {},
+            &temps_nixpacks::providers::php::PhpProvider {},
+            &temps_nixpacks::providers::ruby::RubyProvider {},
+            &temps_nixpacks::providers::deno::DenoProvider {},
+            &temps_nixpacks::providers::elixir::ElixirProvider {},
+            &temps_nixpacks::providers::csharp::CSharpProvider {},
+            &temps_nixpacks::providers::fsharp::FSharpProvider {},
+            &temps_nixpacks::providers::dart::DartProvider {},
+            &temps_nixpacks::providers::swift::SwiftProvider {},
+            &temps_nixpacks::providers::zig::ZigProvider {},
+            &temps_nixpacks::providers::scala::ScalaProvider {},
+            &temps_nixpacks::providers::haskell::HaskellStackProvider {},
+            &temps_nixpacks::providers::clojure::ClojureProvider {},
+            &temps_nixpacks::providers::crystal::CrystalProvider {},
+            &temps_nixpacks::providers::cobol::CobolProvider {},
+            &temps_nixpacks::providers::gleam::GleamProvider {},
+            &temps_nixpacks::providers::lunatic::LunaticProvider {},
+            &temps_nixpacks::providers::scheme::HauntProvider {},
+            &temps_nixpacks::providers::staticfile::StaticfileProvider {},
         ];
 
         let mut generator =
@@ -729,10 +720,10 @@ mod tests {
 
         let (plan, _) = generator.generate_plan(&app, &environment).ok()?;
 
-        // Get the build plan string which contains the detected info
-        let build_string = plan.get_build_string().ok()?;
-
-        Some(build_string)
+        // Provider detection labels are stored as NIXPACKS_METADATA (e.g. "node,npm").
+        plan.variables
+            .as_ref()
+            .and_then(|vars| vars.get("NIXPACKS_METADATA").cloned())
     }
 
     fn create_nodejs_project() -> TempDir {

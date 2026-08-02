@@ -1,0 +1,34 @@
+[package]
+name = "temps-nixpacks"
+version.workspace = true
+edition.workspace = true
+# Vendored from Railway nixpacks 1.41.0 (MIT). Keep MIT rather than the
+# workspace Apache-2.0 so upstream license terms stay accurate.
+license = "MIT"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Internal fork of nixpacks for Dockerfile/plan generation used by temps-presets"
+publish = false
+
+[lib]
+name = "temps_nixpacks"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+cargo_toml = "0.20.4"
+globset = { version = "0.4.9", default-features = false }
+ignore = "0.4.18"
+indoc = "1.0.7"
+node-semver = "2.1.0"
+path-slash = "0.2.1"
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+# nixpacks plan/config parsing targets toml 0.5's Value/Deserializer shape.
+toml = "0.5.11"
+
+[dev-dependencies]
+tempfile = { workspace = true }

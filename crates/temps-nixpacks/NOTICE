@@ -1,0 +1,10 @@
+temps-nixpacks
+==============
+
+This crate is derived from nixpacks v1.41.0 by Railway Corp.
+Upstream project: https://github.com/railwayapp/nixpacks
+Upstream license: MIT (see LICENSE)
+
+Temps maintains a trimmed library-only fork for Dockerfile and build-plan
+generation. The CLI binary and unused docker-daemon / incremental-cache
+file-server paths are not included.
